@@ -168,6 +168,11 @@ screen's turnover, following WorldQuant's own rule of thumb:
 
 Families run before any new screening, so promising ideas are finished quickly.
 
+**Repair.** If a family's best variant is strong (Fitness ≥ 1, stable) but fails *only* the weight-concentration
+test, the miner tries three repairs: filling short data gaps (`ts_backfill(expr, 5)`), a lower 5% per-stock cap,
+and both together. Concentration usually comes from days when data is missing for most stocks, so the book
+piles into the few that have values. This exact repair turned a near-miss into the account's second submitted alpha.
+
 **4. Gates.** When every variant in a family is done, the best few are put through the filters in
 section 4. The first to pass all of them goes on the ready list. If it is correlated with an existing winner,
 only the one with higher Fitness is kept.
@@ -308,3 +313,4 @@ work from different copies of the progress and overwrite each other. Disable the
 | Date | Alpha ID | Data | Sharpe | Fitness | Turnover | Status |
 |---|---|---|---|---|---|---|
 | 2026-10-14 | `KPmdPPpk` | Analyst estimates | 1.99 | 1.75 | 11.9% | ACTIVE |
+| 2026-10-14 | `YPxKkrQq` | Options (implied vs realized volatility) | 1.47 | 1.27 | 12.2% | ACTIVE |

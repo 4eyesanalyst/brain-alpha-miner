@@ -42,6 +42,7 @@ MIN_STABILITY = 0.34       # share of a family's variants that must reach Sharpe
 MAX_BAD_YEARS = 1          # at most this many losing years in the in-sample period
 MIN_RECENT_SHARPE = 0.5    # the last ~2 years must still be clearly profitable
 MAX_CORRELATION = 0.7      # same cutoff BRAIN uses for self-correlation
+REPAIRABLE = {"CONCENTRATED_WEIGHT"}  # failures worth a repair attempt when everything else is strong
 MIN_FIELD_COVERAGE = 0.3
 FIELDS_MAX_AGE_DAYS = 7
 SCOPE = {"region": "USA", "delay": 1, "universe": "TOP3000"}
@@ -367,18 +368,42 @@ class Miner:
         ok = [r for r in results if not r.get("error") and r.get("sharpe") is not None]
         if not ok:
             return
-        stability = sum(r["sharpe"] >= PROMISING_SHARPE for r in ok) / len(ok)
-        passing = sorted((r for r in ok if not fails(r) and (r["fitness"] or 0) >= MIN_FITNESS and r["sharpe"] > 0),
-                         key=lambda r: -r["fitness"])
+        # A repair family inherits the stability of the family it came from.
+        stability = fam.get("parent_stability", sum(r["sharpe"] >= PROMISING_SHARPE for r in ok) / len(ok))
+        good = lambda r: (r["fitness"] or 0) >= MIN_FITNESS and r["sharpe"] > 0
+        passing = sorted((r for r in ok if not fails(r) and good(r)), key=lambda r: -r["fitness"])
         best = max(ok, key=lambda r: r["fitness"] or -9)
         log(f"  family done: {fam['template']} {fam['x']} -> {len(passing)}/{len(ok)} pass, "
             f"stability {stability:.0%}, best F={best['fitness']}")
-        if passing and stability < MIN_STABILITY:
-            log("  rejected: only a few parameter choices work (likely luck, would not hold up out-of-sample)")
+        if stability < MIN_STABILITY:
+            if passing:
+                log("  rejected: only a few parameter choices work (likely luck, would not hold up out-of-sample)")
             return
         for r in passing[:3]:
             if self.consider(r, stability):
                 return
+        near = [r for r in ok if good(r) and fails(r) and set(fails(r)) <= REPAIRABLE]
+        if near and fam["template"] != "repair":
+            self.open_repair(fam, max(near, key=lambda r: r["fitness"]), stability)
+
+    def open_repair(self, fam, r, stability):
+        """Strong signal that fails only on weight concentration: usually days with missing data push the book
+        into the few stocks that do have values. Fill short gaps and/or cap single-stock weight lower."""
+        filled = f"ts_backfill({r['expr']}, 5)"
+        s = r["settings"]
+        jobs = [{"expr": filled, "settings": {**s}},
+                {"expr": filled, "settings": {**s, "truncation": 0.05}},
+                {"expr": r["expr"], "settings": {**s, "truncation": 0.05}}]
+        fid = hashlib.sha1(f"repair|{r['expr']}|{json.dumps(s, sort_keys=True)}".encode()).hexdigest()[:12]
+        with _lock:
+            if fid in self.families:
+                return
+            self.families[fid] = {"template": "repair", "x": r["expr"], "dataset": fam.get("dataset"),
+                                  "category": fam.get("category"), "sign": 1, "parent_stability": stability,
+                                  "jobs": jobs}
+            write_json(FAMILIES, self.families)
+        log(f"  near miss (only {fails(r)}) -> trying {len(jobs)} repairs: {r['expr']}")
+        self.schedule_family(fid)
 
     def consider(self, r, stability):
         """Returns True once the idea is settled (accepted or already covered), False to try the next variant."""
