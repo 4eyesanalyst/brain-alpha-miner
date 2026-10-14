@@ -314,3 +314,4 @@ work from different copies of the progress and overwrite each other. Disable the
 |---|---|---|---|---|---|---|
 | 2026-10-14 | `KPmdPPpk` | Analyst estimates | 1.99 | 1.75 | 11.9% | ACTIVE |
 | 2026-10-14 | `YPxKkrQq` | Options (implied vs realized volatility) | 1.47 | 1.27 | 12.2% | ACTIVE |
+| 2026-10-14 | `O0JP5abJ` | Options (same idea, sector-ranked, 5% cap; 0.94 corr with `YPxKkrQq`) | 1.64 | 1.48 | 10.6% | ACTIVE |
