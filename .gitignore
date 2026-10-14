@@ -1,0 +1,14 @@
+# This repository is PUBLIC. Anything that reveals alpha formulas stays out of git:
+# the miner's working state is committed only in encrypted form (miner_state.enc, see vault.py).
+miner/
+ideas/
+results/
+
+# Downloaded BRAIN documentation: WorldQuant's content plus personal account details.
+# Regenerate locally with brain_fetch_docs.ps1.
+docs/
+
+__pycache__/
+*.pyc
+.venv/
+.env

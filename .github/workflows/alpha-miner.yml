@@ -1,0 +1,77 @@
+# Runs the alpha miner on GitHub's servers around the clock — no local PC needed.
+#
+# A job may run at most 6 hours, so a run starts every 6 hours and mines for ~5.5 hours
+# (MINER_MINUTES). Each run decrypts the saved state, mines, re-encrypts it into
+# miner_state.enc and commits it, so the next run resumes exactly where this one stopped.
+# The repository is public: formulas never appear in logs, issues or plain files.
+name: alpha-miner
+
+on:
+  schedule:
+    - cron: "7 */6 * * *"    # 00:07, 06:07, 12:07, 18:07 UTC
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How many minutes to mine"
+        default: "330"
+
+permissions:
+  contents: write   # commit the encrypted progress
+  issues: write     # announce new alphas
+
+concurrency:
+  group: alpha-miner
+  cancel-in-progress: false
+
+jobs:
+  mine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      BRAIN_EMAIL: ${{ secrets.BRAIN_EMAIL }}
+      BRAIN_PASSWORD: ${{ secrets.BRAIN_PASSWORD }}
+      MINER_STATE_KEY: ${{ secrets.MINER_STATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Restore progress
+        run: python vault.py unpack
+
+      - name: Mine alphas
+        env:
+          MINER_MINUTES: ${{ inputs.minutes || vars.MINER_MINUTES || '330' }}
+          MINER_MAX_SIMS_PER_DAY: ${{ vars.MINER_MAX_SIMS_PER_DAY || '600' }}
+        run: python miner.py
+
+      - name: Save progress
+        if: always()
+        run: |
+          python vault.py pack
+          git config user.name "alpha-miner[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add miner_state.enc
+          if ! git diff --cached --quiet; then
+            git commit -m "miner: progress $(date -u '+%Y-%m-%d %H:%M') UTC"
+            git pull --rebase
+            git push
+          fi
+
+      - name: Announce new alphas
+        if: hashFiles('miner/new_ready.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "The miner found new alphas that pass every check, including correlation."
+            echo "Open each Alpha ID on BRAIN (**Alphas → Unsubmitted**) and submit 1–2 per day."
+            echo
+            cat miner/new_ready.md
+          } > body.md
+          gh issue create --title "New alphas ready to submit ($(date -u '+%Y-%m-%d'))" --body-file body.md
