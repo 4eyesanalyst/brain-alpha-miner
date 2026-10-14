@@ -72,7 +72,7 @@ jobs:
           ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Announce new alphas
-        if: hashFiles('miner/new_ready.md') != ''
+        if: always() && hashFiles('miner/new_ready.md') != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
