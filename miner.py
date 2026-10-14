@@ -56,6 +56,7 @@ FIELDS = DIR / "fields.json"       # cached field catalogue
 SEEDS = DIR / "seeds.json"         # researched ideas, tried before the generic templates (kept encrypted)
 STATE = DIR / "state.json"         # daily simulation counter
 REPORT = DIR / "report.json"       # day of the last Telegram daily report
+REPORTED = DIR / "reported.json"   # every alpha already run through the official check for Telegram
 NEW_READY = DIR / "new_ready.md"   # winners found in this run (used for notifications)
 LOG = DIR / "miner.log"
 LOCK = DIR / "miner.lock"
@@ -166,6 +167,23 @@ def fails(r):
     return [c["name"] for c in r.get("checks", []) if c.get("result") == "FAIL"]
 
 
+def passes_is(r):
+    """Passed every in-sample check BRAIN ran during the simulation (self-correlation is checked separately)."""
+    return (not r.get("error") and r.get("alphaId") and not fails(r)
+            and (r.get("fitness") or 0) >= MIN_FITNESS and (r.get("sharpe") or 0) > 0)
+
+
+def idea_code(expr):
+    """Same code for variants of one idea (different windows, sign, gap-filling repair) so the user can spot near-copies."""
+    core = expr.strip()
+    if core.startswith("ts_backfill(") and core.endswith(", 5)"):
+        core = core[len("ts_backfill("):-len(", 5)")]
+    if core.startswith("-(") and core.endswith(")"):
+        core = core[2:-1]
+    core = re.sub(r"\d+(\.\d+)?", "", core.lstrip("-")).replace(" ", "")
+    return hashlib.sha1(core.encode()).hexdigest()[:5].upper()
+
+
 def corr(a, b):
     dates = [d for d in a if d in b]
     if len(dates) < 100:
@@ -222,6 +240,8 @@ class Miner:
         self.stop = threading.Event()
         self.reference_pnls, self.ready_pnls = {}, {}
         self.run_sims, self.run_winners = 0, 0
+        reported = json.loads(REPORTED.read_text(encoding="utf-8")) if REPORTED.exists() else {}
+        self.reported = {k: v for k, v in reported.items() if v != "checking"}  # retry checks cut off by a stop
 
     # ---- inputs ---------------------------------------------------------------------------
     def load_fields(self, force=False):
@@ -465,16 +485,59 @@ class Miner:
             + (f" (replaces {len(rivals)} weaker correlated version)" if rivals else ""))
         if PRIVATE_CONSOLE:
             print(f"*** new alpha ready to submit: {r['alphaId']} Sharpe={r['sharpe']:.2f} Fitness={r['fitness']:.2f}", flush=True)
+        notify.send(f"⭐ Recommended: {r['alphaId']} (idea {idea_code(r['expr'])})\n"
+                    f"The best version of this idea, and it also clears the miner's extra quality gates: "
+                    f"stable across settings ({stability:.0%}), at most one losing year, strong last 2 years "
+                    f"(Sharpe {recent:.2f}), and distinct from your submitted alphas (max corr {max_corr:.2f}).")
+        return True
+
+    # ---- Telegram: every alpha that passes BRAIN's checks -------------------------------
+    def report_pass(self, r):
+        """Run the official check on an alpha that passed the IS checks; if it passes, send it to Telegram."""
+        aid = r["alphaId"]
+        with _lock:
+            if aid in self.reported:
+                return
+            self.reported[aid] = "checking"
+        checks = self.brain.check(aid).get("is", {}).get("checks", [])
+        failed = [c["name"] for c in checks if c.get("result") == "FAIL"]
+        self_corr = next((c.get("value") for c in checks if c.get("name") == "SELF_CORRELATION"), None)
+        with _lock:
+            self.reported[aid] = ("fail:" + ",".join(failed)) if failed else "pass"
+            write_json(REPORTED, self.reported)
+        if failed:
+            log(f"  {aid} passed the simulation checks but failed the official check: {failed}")
+            return
+        pnl = self.brain.daily_pnl(aid)
+        years, recent = yearly_sharpe(pnl), recent_sharpe(pnl)
+        corrs = {sid: corr(pnl, ref) for sid, ref in self.reference_pnls.items()}
+        closest = max(corrs, key=corrs.get) if corrs else None
         s = r["settings"]
-        notify.send(f"🟢 New alpha ready to submit: {r['alphaId']}\n"
-                    f"Data: {r.get('dataset') or 'unknown'}\n"
+        years_txt = " ".join(f"{y[2:]}:{v:+.1f}" for y, v in years.items())
+        log(f"  PASS sent to Telegram: {aid} {r['expr']}")
+        notify.send(f"✅ Passing alpha: {aid}\n"
+                    f"Idea {idea_code(r['expr'])} · data: {r.get('dataset') or 'unknown'}\n"
                     f"Sharpe {r['sharpe']:.2f} · Fitness {r['fitness']:.2f} · Turnover {r['turnover']*100:.1f}%\n"
                     f"Returns {r['returns']*100:.1f}% · Drawdown {r['drawdown']*100:.1f}%\n"
-                    f"Last 2 years Sharpe {recent:.2f} · max correlation {max_corr:.2f}\n"
+                    f"Yearly Sharpe {years_txt} · last 2y {recent:.2f}\n"
+                    f"BRAIN self-correlation {self_corr}"
+                    + (f" · closest submitted: {closest} ({corrs[closest]:.2f})" if closest else "") + "\n"
                     f"Settings: {s['neutralization']}, decay {s['decay']}, truncation {s['truncation']}\n"
-                    f"Passed every check incl. BRAIN's official pre-submission check.\n"
-                    f"Submit: BRAIN → Alphas → Unsubmitted → {r['alphaId']}")
-        return True
+                    f"Same idea code = near-copies: submit at most one per code.\n"
+                    f"Submit: BRAIN → Alphas → Unsubmitted → {aid}")
+
+    def report_backlog(self):
+        """Send passing alphas found before Telegram reporting existed (or cut off by a stop)."""
+        backlog = [r for r in list(self.tried.values()) if passes_is(r) and r["alphaId"] not in self.reported]
+        for r in sorted(backlog, key=lambda r: -(r["fitness"] or 0)):
+            if self.stop.is_set():
+                return
+            try:
+                self.report_pass(r)
+            except requests.RequestException as e:
+                log(f"backlog report failed for {r['alphaId']}: {e}", public=True)
+                with _lock:
+                    self.reported.pop(r["alphaId"], None)
 
     # ---- main loop ------------------------------------------------------------------------
     def worker(self):
@@ -504,6 +567,8 @@ class Miner:
                     status = "error" if r.get("error") else ("pass" if not slim["fails"] else "fail")
                     print(f"{datetime.now():%H:%M:%S} sim #{self.run_sims} stage {job['stage']} {job.get('dataset', '')}: "
                           f"{status} Sharpe={r.get('sharpe')} Fitness={r.get('fitness')}", flush=True)
+                if passes_is(slim):
+                    self.report_pass(slim)
                 if not r.get("error") and job["stage"] == 1 and abs(r["sharpe"] or 0) >= PROMISING_SHARPE:
                     self.open_family(job, r)
                 if job.get("fid"):
@@ -531,6 +596,7 @@ class Miner:
         threads = [threading.Thread(target=self.worker, daemon=True) for _ in range(CONCURRENCY)]
         for t in threads:
             t.start()
+        threading.Thread(target=self.report_backlog, daemon=True).start()
         last_refresh = time.time()
         while any(t.is_alive() for t in threads):
             time.sleep(15)
