@@ -26,11 +26,12 @@ import threading
 import time
 import traceback
 from collections import defaultdict, deque
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
 
+import notify
 from brain import Brain, CONCURRENCY, DEFAULT_SETTINGS, summarize
 
 # ---- knobs (environment variables override the defaults) ------------------------------------
@@ -54,6 +55,7 @@ READY = DIR / "ready.json"         # alphas worth submitting, best first
 FIELDS = DIR / "fields.json"       # cached field catalogue
 SEEDS = DIR / "seeds.json"         # researched ideas, tried before the generic templates (kept encrypted)
 STATE = DIR / "state.json"         # daily simulation counter
+REPORT = DIR / "report.json"       # day of the last Telegram daily report
 NEW_READY = DIR / "new_ready.md"   # winners found in this run (used for notifications)
 LOG = DIR / "miner.log"
 LOCK = DIR / "miner.lock"
@@ -463,6 +465,15 @@ class Miner:
             + (f" (replaces {len(rivals)} weaker correlated version)" if rivals else ""))
         if PRIVATE_CONSOLE:
             print(f"*** new alpha ready to submit: {r['alphaId']} Sharpe={r['sharpe']:.2f} Fitness={r['fitness']:.2f}", flush=True)
+        s = r["settings"]
+        notify.send(f"🟢 New alpha ready to submit: {r['alphaId']}\n"
+                    f"Data: {r.get('dataset') or 'unknown'}\n"
+                    f"Sharpe {r['sharpe']:.2f} · Fitness {r['fitness']:.2f} · Turnover {r['turnover']*100:.1f}%\n"
+                    f"Returns {r['returns']*100:.1f}% · Drawdown {r['drawdown']*100:.1f}%\n"
+                    f"Last 2 years Sharpe {recent:.2f} · max correlation {max_corr:.2f}\n"
+                    f"Settings: {s['neutralization']}, decay {s['decay']}, truncation {s['truncation']}\n"
+                    f"Passed every check incl. BRAIN's official pre-submission check.\n"
+                    f"Submit: BRAIN → Alphas → Unsubmitted → {r['alphaId']}")
         return True
 
     # ---- main loop ------------------------------------------------------------------------
@@ -532,8 +543,25 @@ class Miner:
                     self.refresh_references()
                 except requests.RequestException as e:
                     log(f"refresh failed: {e}", public=True)
+        self.daily_report()
         log(f"run finished: {self.run_sims} simulations, {self.run_winners} new alphas ready, "
             f"{len(self.ready)} on the ready list, {len(self.families)} families still tuning", public=True)
+
+
+    def daily_report(self):
+        """Once a day: a short Telegram heartbeat so silence never means 'did it stop?'."""
+        today = str(date.today())
+        if REPORT.exists() and json.loads(REPORT.read_text(encoding="utf-8")).get("day") == today:
+            return
+        cutoff = (datetime.now() - timedelta(days=1)).isoformat()
+        last_day = [r for r in self.tried.values() if (r.get("time") or "") >= cutoff]
+        promising = sum(abs(r.get("sharpe") or 0) >= PROMISING_SHARPE for r in last_day)
+        waiting = ", ".join(r["alphaId"] for r in self.ready) or "none"
+        if notify.send(f"⚪ Daily miner report\n"
+                       f"Last 24h: {len(last_day)} simulations, {promising} promising\n"
+                       f"Ready to submit: {waiting}\n"
+                       f"Ideas being tuned: {len(self.families)} · total simulations so far: {len(self.tried)}"):
+            write_json(REPORT, {"day": today})
 
 
 def single_instance():

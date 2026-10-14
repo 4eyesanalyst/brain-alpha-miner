@@ -31,6 +31,8 @@ jobs:
       BRAIN_EMAIL: ${{ secrets.BRAIN_EMAIL }}
       BRAIN_PASSWORD: ${{ secrets.BRAIN_PASSWORD }}
       MINER_STATE_KEY: ${{ secrets.MINER_STATE_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
       - uses: actions/checkout@v4
 
@@ -62,6 +64,12 @@ jobs:
             git pull --rebase
             git push
           fi
+
+      - name: Alert on failure
+        if: failure()
+        run: >
+          python notify.py send "🔴 Alpha miner run failed. Details:
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Announce new alphas
         if: hashFiles('miner/new_ready.md') != ''

@@ -52,8 +52,16 @@ class Brain:
                                 auth=(_credential("BRAIN_EMAIL"), _credential("BRAIN_PASSWORD")))
         if res.status_code == 401 and res.headers.get("WWW-Authenticate") == "persona":
             # BRAIN wants a one-off identity (biometric) check, e.g. when logging in from a new location.
-            raise RuntimeError("login needs identity verification: open "
-                               f"{API}{res.headers.get('Location', '')} in a browser, complete it, then rerun")
+            # The link belongs to this account, so it goes to Telegram, not into a (public) CI log.
+            import notify
+            link = f"{API}{res.headers.get('Location', '')}"
+            sent = notify.send(f"🔴 BRAIN needs a one-off identity check before the miner can log in.\n"
+                               f"Open this link, complete it, then re-run the workflow:\n{link}")
+            public = os.environ.get("GITHUB_ACTIONS") == "true"
+            raise RuntimeError("login needs identity verification: "
+                               + ("link sent via Telegram" if public and sent else
+                                  "check Telegram or run the miner locally to see the link" if public else
+                                  f"open {link} in a browser, complete it, then rerun"))
         if res.status_code != 201:
             raise RuntimeError(f"login failed: HTTP {res.status_code} {res.text}")
 

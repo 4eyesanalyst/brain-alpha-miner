@@ -76,6 +76,7 @@ kept out of git; see below.
 |---|---|
 | `miner.py` | **The agent.** Continuous, restart-proof alpha search (explained below). |
 | `brain.py` | Small BRAIN API client: login, simulate, official pre-submission check, daily PnL, dataset and field catalogue. Also a CLI for running hand-written ideas: `python brain.py ideas/batch1.json`. |
+| `notify.py` | Telegram alerts: winners the moment they're found, failed runs, a daily heartbeat. IDs and statistics only, never formulas. |
 | `vault.py` | Encrypts `miner/` into `miner_state.enc` and decrypts it back (`pack` / `unpack` / `newkey`). |
 | `miner_state.enc` | **The miner's memory, encrypted.** The only part of the results that is committed. |
 | `.github/workflows/alpha-miner.yml` | Runs the miner 24/7 on GitHub's servers (4 runs of about 5.5 hours a day). It restores and saves the encrypted state. |
@@ -235,7 +236,15 @@ These are honest estimates; the real numbers build up in `miner/tried.jsonl` ove
    - `MINER_STATE_KEY`: the encryption key (`python vault.py newkey` creates one). **Keep a copy.** Without it
      the saved progress cannot be decrypted, and the miner would start its search from scratch.
 2. **Start it:** under *Actions → alpha-miner → Run workflow*. After that it runs by itself, every 6 hours, around the clock.
-3. **Get notified:** new winners open a GitHub issue, which GitHub emails to you. Make sure *Watch* is set for the repository.
+3. **Get notified on Telegram (recommended):** create a bot with **@BotFather** (`/newbot`), send your bot any
+   message, then add two more secrets: `TELEGRAM_BOT_TOKEN` (from BotFather) and `TELEGRAM_CHAT_ID`
+   (`python notify.py chats` prints it). You then get:
+   - 🟢 **New alpha ready**, the moment a winner passes every gate: Alpha ID, Sharpe, Fitness, turnover, settings.
+   - 🔴 **Run failed**, with a link to the run. If BRAIN asks for an identity check, the link comes here
+     privately instead of appearing in the public log.
+   - ⚪ **Daily report**, once a day: simulations, promising ideas, alphas waiting, ideas being tuned.
+
+   Winners are also posted as a GitHub issue at the end of each run, which GitHub emails to you.
 
 **Schedule and minutes.** GitHub limits a job to 6 hours, so a run starts at 00:07, 06:07, 12:07 and 18:07 UTC
 and mines for about 5.5 hours (`MINER_MINUTES`, default 330). Public repositories get unlimited free Actions
@@ -254,6 +263,7 @@ and re-run the workflow.
 | Formulas, simulation history, ready list, full log | Only inside `miner_state.enc` (encrypted with `MINER_STATE_KEY`) |
 | Actions run logs | Public, but in the cloud the miner prints only counts, Sharpe/Fitness numbers and alpha IDs |
 | Notification issues | Public: alpha IDs and statistics only. An alpha ID can be opened only from the owner's BRAIN account |
+| Telegram messages | Private chat with your bot: alpha IDs, statistics, run links, identity-check links. Never formulas |
 | BRAIN password | GitHub Secrets only (encrypted and masked in logs) |
 
 ## 7. Daily routine: submitting alphas
