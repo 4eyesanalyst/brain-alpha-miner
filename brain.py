@@ -35,6 +35,8 @@ def _credential(name):
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
             value = winreg.QueryValueEx(key, name)[0]
+    # Values piped in from Windows PowerShell can carry a byte-order mark and a trailing newline.
+    value = (value or "").strip().lstrip("﻿").strip()
     if not value:
         raise RuntimeError(f"{name} is not set")
     return value
