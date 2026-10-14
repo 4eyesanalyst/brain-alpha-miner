@@ -120,23 +120,53 @@ with coverage of at least 30%, about **4,000 fields**. The fields are interleave
 first (fewest existing alphas on BRAIN), so the search spreads over all the data early and favours fields that
 other users rarely touch. Those fields are less likely to be correlated with existing alphas.
 
-**2. Stage 1: screening.** Each field `x` is plugged into idea templates that encode the most reliable patterns
-from BRAIN's documentation. Sparse fields are wrapped in `ts_backfill(x, 66)` and vector fields in `vec_avg(x)`.
+**2. Stage 1: screening.** First come the **seed ideas**: about 50 signals taken from research, including the academic
+anomaly literature, WorldQuant's own *101 Formulaic Alphas* paper, BRAIN's documentation, and alphas the
+BRAIN community has published along with their stats. Seeds are kept in `miner/seeds.json`, inside the
+encrypted state, because a seed that passes *is* an alpha formula. Then every field `x` is plugged into the
+generic templates, pass by pass, so the broadest search comes first:
 
-| Template | Expression | Idea |
+| Template | Pass | Expression | Idea |
+|---|---|---|---|
+| `tsrank` | 1 | `group_rank(ts_rank(x, w), industry)` | Is `x` high versus its own history, compared with industry peers? (the community's most reliable pattern) |
+| `zscore` | 1 | `ts_zscore(x, w)` | How unusual is today's `x` for this stock? |
+| `revision` | 2 | `group_rank(ts_delta(x, w)/(abs(ts_delay(x, w)) + 0.0001), industry)` | Percentage revision. Analysts and fundamentals drift after revisions |
+| `volnorm` | 2 | `group_rank(ts_delta(x, w)/(ts_std_dev(x, w) + 0.0001), subindustry)` | Change measured in units of its own volatility |
+| `avdiff` | 2 | `group_neutralize(ts_av_diff(x, w), subindustry)` | Distance from its own recent average |
+| `level` | 3 | `group_rank(x, subindustry)` | Is `x` high compared with direct competitors? |
+| `to_cap` | 3 | `group_rank(x/cap, subindustry)` | Fundamental/analyst value per dollar of market cap (a "yield") |
+
+**Preparing a field** (`field_expr`):
+- *Trap fields are skipped:* corporate-action bookkeeping (`adjfactor`, `split`, `dividend`) and static relationship
+  counts, whose ~1% turnover caps Fitness however good the Sharpe.
+- *Option price levels* are divided by `close`.
+- *Vectors* are summed (counts, buzz) or averaged (scores).
+- *Sparse news vectors* get a 504-day backfill, sparse fundamentals 252 days and other sparse fields 66 days.
+
+**Settings per data type.** What works differs by dataset, so each category has its own screening setup:
+
+| Data | Neutralization (screen → alternative) | Screening decay |
 |---|---|---|
-| `tsrank_ind` (pass 1) | `group_rank(ts_rank(x, w), industry)` | Is `x` high versus its own history, compared with industry peers? |
-| `zscore` (pass 1) | `ts_zscore(x, w)` | How unusual is today's `x` for this stock? |
-| `level_sub` (pass 2) | `group_rank(x, subindustry)` | Is `x` high compared with direct competitors? |
-| `delta` (pass 2) | `group_rank(ts_delta(x, w), subindustry)` | Is `x` improving faster than competitors'? |
-| `to_cap` (pass 2) | `group_rank(x/cap, subindustry)` | Fundamental/analyst value per dollar of market cap (a "yield") |
+| Fundamental | sub-industry → industry | 2 |
+| Analyst, model | industry → sub-industry | 2 |
+| Options | sector → market | 4 |
+| News, social media | industry → sub-industry | 6 |
+| Price-volume | industry → market | 10 |
 
-Pass 1 runs over every field before pass 2 starts, so the broadest search comes first. A negative Sharpe is
-just as informative as a positive one: the idea is simply flipped (`-expr`).
+A negative Sharpe is just as informative as a positive one: the idea is simply flipped (`-(expr)`).
 
 **3. Stage 2: tuning.** Any screen with |Sharpe| ≥ 1.0 opens a **family** of up to 13 variants:
-3 lookback windows × decay {3, 8} × neutralization {industry, sub-industry}, plus the original. These run before
-any new screening, so promising ideas are finished quickly.
+3 lookback windows × 2 decays × the category's 2 neutralizations, plus the original. The decays are chosen from the
+screen's turnover, following WorldQuant's own rule of thumb:
+
+| Screen turnover | Decays tried |
+|---|---|
+| > 50% | 12, 20 |
+| > 30% | 6, 12 |
+| > 12.5% | 2, 6 |
+| ≤ 12.5% | 0, 3. Below 12.5% turnover, decay cannot raise Fitness, so it's kept low to preserve returns |
+
+Families run before any new screening, so promising ideas are finished quickly.
 
 **4. Gates.** When every variant in a family is done, the best few are put through the filters in
 section 4. The first to pass all of them goes on the ready list. If it is correlated with an existing winner,
@@ -165,7 +195,7 @@ miner therefore applies stricter checks than BRAIN does.
 |---|---|---|
 | **1. BRAIN IS checks** | No failed check (Sharpe, Fitness, turnover, weight, sub-universe); Fitness ≥ 1 | The minimum BRAIN needs before a submission is accepted. |
 | **2. Parameter stability** | At least 34% of the family's variants reach Sharpe ≥ 1 | Trying many variants and keeping the best is a form of overfitting. If only one lucky window/decay combination works, the "signal" is probably noise. A real effect survives small parameter changes. |
-| **3. Year consistency** | At most 1 losing year in the IS period (Sharpe per calendar year) | Rejects alphas whose Sharpe comes from a single great year. Those tend to fail out-of-sample. |
+| **3. Year consistency** | At most 1 losing year in the IS period (Sharpe per calendar year), **and** a Sharpe of at least 0.5 over the last 2 years | Rejects alphas whose Sharpe comes from a single great year, or that have stopped working recently. Both tend to fail out-of-sample. |
 | **4. Correlation** | Daily-PnL correlation < 0.7 with every alpha you've submitted and with every other winner | Mirrors BRAIN's self-correlation test before spending the official check. It also keeps the ready list *diverse*, which is what the Challenge rewards. |
 | **5. Official check** | BRAIN's own pre-submission check (the "Check Submission" button) passes in full | The final word, including BRAIN's official self-correlation calculation. |
 
@@ -189,7 +219,7 @@ These are honest estimates; the real numbers build up in `miner/tried.jsonl` ove
 - **What it will *not* do:** guarantee out-of-sample performance (no one can), produce Spectacular alphas on
   demand, or submit for you. Submitting is permanent, so a human decides.
 - **The search space is finite:** with the current templates, a full pass over all ~4,000 fields is roughly
-  17,000 screens, about a month at the daily cap. When everything has been tried, the miner idles and
+  25,000 screens plus tuning, about 6–8 weeks at the daily cap. When everything has been tried, the miner idles and
   re-checks for new datasets every 6 hours. At that point the best upgrade is new templates in `TEMPLATES`.
 
 ## 6. Setup: running it in the cloud (GitHub Actions)
@@ -254,8 +284,9 @@ work from different copies of the progress and overwrite each other. Disable the
 |---|---|---|---|
 | `MINER_MINUTES` | env / repository variable | `0` locally (forever), `330` in Actions | Mine this long, then save and exit |
 | `MINER_MAX_SIMS_PER_DAY` | env / repository variable | `600` | Daily simulation cap |
-| `MIN_FITNESS`, `MIN_STABILITY`, `MAX_BAD_YEARS`, `MAX_CORRELATION` | top of `miner.py` | 1.0, 0.34, 1, 0.7 | Strictness of the gates |
-| `TEMPLATES`, `TUNE_DECAYS`, `TUNE_NEUTRALIZATIONS` | `miner.py` | see file | The idea space being searched |
+| `MIN_FITNESS`, `MIN_STABILITY`, `MAX_BAD_YEARS`, `MIN_RECENT_SHARPE`, `MAX_CORRELATION` | top of `miner.py` | 1.0, 0.34, 1, 0.5, 0.7 | Strictness of the gates |
+| `TEMPLATES`, `CATEGORY_SETTINGS`, `tune_decays`, `TRAP_FIELDS` | `miner.py` | see file | The idea space being searched |
+| Seed ideas | `miner/seeds.json` (encrypted) | ~50 researched signals | Tried before the generic templates |
 | `SCOPE` | `miner.py` | USA / D1 / TOP3000 | Region, delay, universe |
 
 ## 10. Limits, risks and rules

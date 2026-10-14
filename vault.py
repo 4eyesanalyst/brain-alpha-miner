@@ -39,6 +39,7 @@ def pack():
                 data = b"\n".join(data.splitlines()[-LOG_TAIL_LINES:]) + b"\n"
             info = tarfile.TarInfo(path.name)
             info.size = len(data)
+            info.mtime = int(path.stat().st_mtime)  # the miner uses file age to decide when to refresh caches
             tar.addfile(info, io.BytesIO(data))
     VAULT.write_bytes(_fernet().encrypt(buf.getvalue()))
     print(f"packed {STATE_DIR.name}/ -> {VAULT.name} ({VAULT.stat().st_size // 1024} KB)")

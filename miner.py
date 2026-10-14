@@ -19,6 +19,7 @@ import itertools
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import threading
@@ -39,6 +40,7 @@ MIN_FITNESS = 1.0          # submission cutoff for Delay 1
 PROMISING_SHARPE = 1.0     # stage-1 |Sharpe| that earns a tuning family
 MIN_STABILITY = 0.34       # share of a family's variants that must reach Sharpe 1.0 (guards against lucky parameters)
 MAX_BAD_YEARS = 1          # at most this many losing years in the in-sample period
+MIN_RECENT_SHARPE = 0.5    # the last ~2 years must still be clearly profitable
 MAX_CORRELATION = 0.7      # same cutoff BRAIN uses for self-correlation
 MIN_FIELD_COVERAGE = 0.3
 FIELDS_MAX_AGE_DAYS = 7
@@ -49,30 +51,87 @@ TRIED = DIR / "tried.jsonl"        # one line per simulation ever run (resume + 
 FAMILIES = DIR / "families.json"   # tuning families still in progress
 READY = DIR / "ready.json"         # alphas worth submitting, best first
 FIELDS = DIR / "fields.json"       # cached field catalogue
+SEEDS = DIR / "seeds.json"         # researched ideas, tried before the generic templates (kept encrypted)
 STATE = DIR / "state.json"         # daily simulation counter
 NEW_READY = DIR / "new_ready.md"   # winners found in this run (used for notifications)
 LOG = DIR / "miner.log"
 LOCK = DIR / "miner.lock"
 
 # ---- idea templates -----------------------------------------------------------------------
-# {x} = the field (backfilled when sparse), {w} = lookback window in trading days.
-# Pass 1 runs over every field first; pass 2 templates follow once pass 1 is exhausted.
+# {x} = the prepared field (see field_expr), {w} = lookback window in trading days.
+# Passes run in order over every field: seeds first, then the broadest templates, then the rest.
 TEMPLATES = {
-    "tsrank_ind": {"expr": "group_rank(ts_rank({x}, {w}), industry)", "windows": [60, 120, 252],
-                   "neutralization": "INDUSTRY", "pass": 1},
-    "zscore":     {"expr": "ts_zscore({x}, {w})", "windows": [60, 126, 252],
-                   "neutralization": "SUBINDUSTRY", "pass": 1},
-    "level_sub":  {"expr": "group_rank({x}, subindustry)", "windows": [None],
-                   "neutralization": "SUBINDUSTRY", "pass": 2},
-    "delta":      {"expr": "group_rank(ts_delta({x}, {w}), subindustry)", "windows": [22, 66, 252],
-                   "neutralization": "SUBINDUSTRY", "pass": 2},
-    "to_cap":     {"expr": "group_rank({x}/cap, subindustry)", "windows": [None],
-                   "neutralization": "SUBINDUSTRY", "pass": 2, "categories": {"fundamental", "analyst"}},
+    "seed":     {"expr": "{x}", "windows": [None], "pass": 0},   # researched ideas from miner/seeds.json
+    "tsrank":   {"expr": "group_rank(ts_rank({x}, {w}), industry)", "windows": [60, 120, 252], "pass": 1},
+    "zscore":   {"expr": "ts_zscore({x}, {w})", "windows": [60, 126, 252], "pass": 1},
+    "revision": {"expr": "group_rank(ts_delta({x}, {w})/(abs(ts_delay({x}, {w})) + 0.0001), industry)",
+                 "windows": [22, 66, 126], "pass": 2, "categories": {"analyst", "fundamental", "model"}},
+    "volnorm":  {"expr": "group_rank(ts_delta({x}, {w})/(ts_std_dev({x}, {w}) + 0.0001), subindustry)",
+                 "windows": [22, 66, 252], "pass": 2},
+    "avdiff":   {"expr": "group_neutralize(ts_av_diff({x}, {w}), subindustry)", "windows": [22, 66, 252], "pass": 2},
+    "level":    {"expr": "group_rank({x}, subindustry)", "windows": [None], "pass": 3},
+    "to_cap":   {"expr": "group_rank({x}/cap, subindustry)", "windows": [None], "pass": 3,
+                 "categories": {"fundamental", "analyst"}},
 }
+PASSES = (0, 1, 2, 3)
+
+# What works differs by data type (BRAIN docs + community experience): the first neutralization is
+# used for screening, both are tried when tuning; decay is the screening decay.
+CATEGORY_SETTINGS = {
+    "fundamental": {"neutralizations": ["SUBINDUSTRY", "INDUSTRY"], "decay": 2},
+    "analyst":     {"neutralizations": ["INDUSTRY", "SUBINDUSTRY"], "decay": 2},
+    "model":       {"neutralizations": ["INDUSTRY", "SUBINDUSTRY"], "decay": 2},
+    "option":      {"neutralizations": ["SECTOR", "MARKET"], "decay": 4},
+    "news":        {"neutralizations": ["INDUSTRY", "SUBINDUSTRY"], "decay": 6},
+    "socialmedia": {"neutralizations": ["INDUSTRY", "SUBINDUSTRY"], "decay": 6},
+    "pv":          {"neutralizations": ["INDUSTRY", "MARKET"], "decay": 10},
+}
+DEFAULT_CATEGORY = {"neutralizations": ["SUBINDUSTRY", "INDUSTRY"], "decay": 4}
 BASE = {"nanHandling": "ON", "truncation": 0.08}
-STAGE1_DECAY = 4
-TUNE_DECAYS = [3, 8]
-TUNE_NEUTRALIZATIONS = ["INDUSTRY", "SUBINDUSTRY"]
+
+# Fields that never make signals: corporate-action bookkeeping and static relationship counts
+# (turnover ~1% caps Fitness no matter the Sharpe).
+TRAP_FIELDS = {"adjfactor", "split", "dividend"}
+TRAP_PATTERN = re.compile(r"count|graphrank|revere")
+PRICE_LEVEL_PATTERN = re.compile(r"breakeven|forward_price")  # option prices: only meaningful relative to close
+SUM_VECTOR_PATTERN = re.compile(r"buzz|volume|count|num")      # vectors of counts are summed, scores averaged
+
+
+def field_expr(f):
+    """Turn a catalogue field into the expression the templates operate on (or None to skip it)."""
+    fid = f["id"]
+    if fid in TRAP_FIELDS or (f["dataset"].startswith("pv13") and TRAP_PATTERN.search(fid)):
+        return None
+    x = fid
+    if f["type"] == "VECTOR":
+        x = f"{'vec_sum' if SUM_VECTOR_PATTERN.search(fid) else 'vec_avg'}({fid})"
+    if PRICE_LEVEL_PATTERN.search(fid):
+        x = f"{x}/close"
+    if f["dataset"] == "news12" and f["type"] == "VECTOR":
+        x = f"ts_backfill({x}, 504)"   # sparse news events: long backfill keeps coverage up
+    elif f["coverage"] < 0.8:
+        x = f"ts_backfill({x}, {252 if f['category'] == 'fundamental' else 66})"
+    return x
+
+
+def tune_decays(turnover):
+    """WorldQuant's own rule of thumb: more decay for fast signals; below 12.5% turnover decay can't help Fitness."""
+    if turnover is None:
+        return [3, 8]
+    if turnover > 0.5:
+        return [12, 20]
+    if turnover > 0.3:
+        return [6, 12]
+    if turnover > 0.125:
+        return [2, 6]
+    return [0, 3]
+
+
+def neutralizations_for(category, first=None):
+    pair = list(CATEGORY_SETTINGS.get(category, DEFAULT_CATEGORY)["neutralizations"])
+    if first and first not in pair:
+        pair = [first, "MARKET" if first == "SECTOR" else "INDUSTRY" if first != "INDUSTRY" else "SUBINDUSTRY"]
+    return pair
 
 _lock = threading.Lock()
 
@@ -128,6 +187,13 @@ def yearly_sharpe(pnl):
     return out
 
 
+def recent_sharpe(pnl, days=504):
+    """Sharpe of the last ~2 years: BRAIN also checks recent performance, and it's the best hint of OS behaviour."""
+    vals = [pnl[d] for d in sorted(pnl)][-days:]
+    sd = statistics.pstdev(vals) if len(vals) > 60 else 0
+    return statistics.mean(vals) / sd * math.sqrt(252) if sd else 0.0
+
+
 def write_json(path, data):
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
@@ -178,21 +244,29 @@ class Miner:
         return slim
 
     def _stage1_jobs(self):
-        """Endless stream of untried stage-1 jobs: pass 1 over all fields, then pass 2, then refresh."""
+        """Endless stream of untried stage-1 jobs: seeds, then each template pass over all fields, then refresh."""
         while True:
             new = 0
             fields = self.load_fields()
-            for p in (1, 2):
-                for f in fields:
-                    x = f["id"] if f["type"] == "MATRIX" else f"vec_avg({f['id']})"
-                    if f["coverage"] < 0.8:
-                        x = f"ts_backfill({x}, 66)"
+            seeds = json.loads(SEEDS.read_text(encoding="utf-8")) if SEEDS.exists() else []
+            for p in PASSES:
+                if p == 0:
+                    candidates = [({"dataset": s.get("dataset", "seed"), "category": s.get("category", "")}, s["expr"],
+                                   {k: s[k] for k in ("neutralization", "decay", "truncation") if k in s}) for s in seeds]
+                else:
+                    candidates = []
+                    for f in fields:
+                        x = field_expr(f)
+                        if x:
+                            cat = CATEGORY_SETTINGS.get(f["category"], DEFAULT_CATEGORY)
+                            candidates.append((f, x, {"neutralization": cat["neutralizations"][0], "decay": cat["decay"]}))
+                for f, x, settings in candidates:
                     for name, t in TEMPLATES.items():
                         if t["pass"] != p or ("categories" in t and f["category"] not in t["categories"]):
                             continue
-                        job = {"stage": 1, "template": name, "x": x, "dataset": f["dataset"],
+                        job = {"stage": 1, "template": name, "x": x, "dataset": f["dataset"], "category": f["category"],
                                "expr": t["expr"].format(x=x, w=t["windows"][len(t["windows"]) // 2]),
-                               "settings": {**BASE, "neutralization": t["neutralization"], "decay": STAGE1_DECAY}}
+                               "settings": {**BASE, **settings}}
                         if key(job["expr"], job["settings"]) not in self.tried:
                             new += 1
                             yield job
@@ -253,16 +327,17 @@ class Miner:
         jobs = []
         if sign > 0:
             jobs.append({k: job[k] for k in ("expr", "settings")})  # the stage-1 result itself competes too
-        for w, d, n in itertools.product(t["windows"], TUNE_DECAYS, TUNE_NEUTRALIZATIONS):
+        neutralizations = neutralizations_for(job.get("category"), job["settings"]["neutralization"])
+        for w, d, n in itertools.product(t["windows"], tune_decays(r.get("turnover")), neutralizations):
             expr = t["expr"].format(x=job["x"], w=w)
-            jobs.append({"expr": f"-{expr}" if sign < 0 else expr,
+            jobs.append({"expr": f"-({expr})" if sign < 0 else expr,
                          "settings": {**BASE, "neutralization": n, "decay": d}})
         fid = hashlib.sha1(f"{job['template']}|{job['x']}|{sign}".encode()).hexdigest()[:12]
         with _lock:
             if fid in self.families:
                 return
             self.families[fid] = {"template": job["template"], "x": job["x"], "dataset": job.get("dataset"),
-                                  "sign": sign, "jobs": jobs}
+                                  "category": job.get("category"), "sign": sign, "jobs": jobs}
             write_json(FAMILIES, self.families)
         log(f"  promising (S={r['sharpe']:.2f}) -> tuning {len(jobs)} variants: {job['expr']}")
         self.schedule_family(fid)
@@ -273,7 +348,7 @@ class Miner:
         with _lock:
             for j in pending:
                 self.priority.append({"stage": 2, "template": fam["template"], "x": fam["x"],
-                                      "dataset": fam.get("dataset"), "fid": fid, **j})
+                                      "dataset": fam.get("dataset"), "category": fam.get("category"), "fid": fid, **j})
         if not pending:
             self.finish_family(fid)
 
@@ -313,6 +388,10 @@ class Miner:
         if len(years) < 3 or len(bad_years) > MAX_BAD_YEARS:
             log(f"  {r['alphaId']} rejected: losing years {bad_years} {years}")
             return False
+        recent = recent_sharpe(pnl)
+        if recent < MIN_RECENT_SHARPE:
+            log(f"  {r['alphaId']} rejected: weak recent performance (last-2-year Sharpe {recent:.2f})")
+            return False
         with _lock:
             max_corr = 0.0
             for sid, ref in self.reference_pnls.items():
@@ -337,6 +416,7 @@ class Miner:
             return False
         entry = {k: r[k] for k in ("alphaId", "expr", "settings", "sharpe", "fitness", "turnover", "returns", "drawdown")}
         entry |= {"dataset": r.get("dataset"), "stability": round(stability, 2), "yearly_sharpe": years,
+                  "recent_2y_sharpe": round(recent, 2),
                   "max_correlation": round(max_corr, 2), "found": datetime.now().isoformat(timespec="seconds")}
         with _lock:
             self.ready = [x for x in self.ready if x not in rivals] + [entry]
