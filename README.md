@@ -263,10 +263,29 @@ and re-run the workflow.
 | Formulas, simulation history, ready list, full log | Only inside `miner_state.enc` (encrypted with `MINER_STATE_KEY`) |
 | Actions run logs | Public, but in the cloud the miner prints only counts, Sharpe/Fitness numbers and alpha IDs |
 | Notification issues | Public: alpha IDs and statistics only. An alpha ID can be opened only from the owner's BRAIN account |
-| Telegram messages | Private chat with your bot: alpha IDs, statistics, run links, identity-check links. Never formulas |
+| Telegram messages | Private chat with your bot: alpha IDs, statistics, run links, identity-check links, auto-submissions. Never formulas |
 | BRAIN password | GitHub Secrets only (encrypted and masked in logs) |
 
 ## 7. Daily routine: submitting alphas
+
+**What reaches Telegram.** Every alpha that passes BRAIN's official check *and* is genuinely new: its daily-PnL
+correlation is below **0.6** with every alpha you've submitted (no "10% better Sharpe" exception) and with every
+alpha already sent to you that you haven't submitted yet. If a new alpha is a *better* version of one already sent,
+it arrives as "🔁 use this instead". Weaker versions are dropped silently. So any alpha in your Telegram can be
+submitted without correlation problems. Each sent alpha is also labelled in BRAIN: named after its ID, tagged
+`passing` and `idea-XXXXX`, and coloured green.
+
+**Automatic submission** (on by default; set the repository variable `MINER_AUTO_SUBMIT` to `off` to stop it).
+The miner submits by itself:
+- only ⭐ Recommended alphas (all gates passed) that were sent to you, with Fitness ≥ `MINER_AUTO_MIN_FITNESS` (1.2);
+- at most `MINER_SUBMITS_PER_DAY` (5) per BRAIN day (New York time). Your manual submissions count toward the limit;
+- only after re-running BRAIN's official check and the correlation check at that moment;
+- each submission (or failure) is announced on Telegram: "🚀 Submitted automatically …".
+
+Note: the Challenge caps a day's score at 2,000, which 1–2 strong alphas usually reach. Extra submissions on the
+same day don't add points but do use up ideas, so a lower limit spreads ideas across more scoring days.
+
+**Doing it by hand:**
 
 1. Open the newest GitHub issue. The best alpha is listed first.
 2. On BRAIN, go to **Alphas → Unsubmitted**, find the Alpha ID, open it, check it and click **Submit**.
@@ -299,6 +318,9 @@ work from different copies of the progress and overwrite each other. Disable the
 |---|---|---|---|
 | `MINER_MINUTES` | env / repository variable | `0` locally (forever), `330` in Actions | Mine this long, then save and exit |
 | `MINER_MAX_SIMS_PER_DAY` | env / repository variable | `600` | Daily simulation cap |
+| `MINER_AUTO_SUBMIT` | env / repository variable | `off` locally, `on` in Actions | Submit Recommended alphas automatically |
+| `MINER_SUBMITS_PER_DAY` | env / repository variable | `5` | Daily submission limit (manual submissions count) |
+| `MINER_AUTO_MIN_FITNESS` | env / repository variable | `1.2` | Minimum Fitness for automatic submission |
 | `MIN_FITNESS`, `MIN_STABILITY`, `MAX_BAD_YEARS`, `MIN_RECENT_SHARPE`, `MAX_CORRELATION` | top of `miner.py` | 1.0, 0.34, 1, 0.5, 0.7 | Strictness of the gates |
 | `TEMPLATES`, `CATEGORY_SETTINGS`, `tune_decays`, `TRAP_FIELDS` | `miner.py` | see file | The idea space being searched |
 | Seed ideas | `miner/seeds.json` (encrypted) | ~50 researched signals | Tried before the generic templates |

@@ -165,6 +165,24 @@ class Brain:
             body["favorite"] = True
         return self.request("PATCH", f"/alphas/{alpha_id}", json=body).ok
 
+    def submit(self, alpha_id, timeout=900):
+        """Submit an alpha (permanent). BRAIN re-runs its checks; returns (submitted?, detail)."""
+        r = self.request("POST", f"/alphas/{alpha_id}/submit")
+        if r.status_code >= 400:
+            return False, f"HTTP {r.status_code}: {r.text[:300]}"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status = self.request("GET", f"/alphas/{alpha_id}").json().get("status")
+            if status == "ACTIVE":
+                return True, status
+            time.sleep(float(r.headers.get("Retry-After", 0)) or 10)
+        return False, f"still {status} after {timeout // 60} min"
+
+    def submissions_on(self, day):
+        """How many alphas the account submitted on a given BRAIN day (YYYY-MM-DD, New York time)."""
+        records = self.request("GET", "/users/self/activities/submissions").json().get("records", {}).get("records", [])
+        return sum(n for d, n in records if d == day)
+
     def submitted_alphas(self):
         return self.request("GET", "/users/self/alphas", params={"status": "ACTIVE", "limit": 100}).json().get("results", [])
 

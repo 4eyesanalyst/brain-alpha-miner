@@ -46,6 +46,12 @@ MAX_BAD_YEARS = 1          # at most this many losing years in the in-sample per
 MIN_RECENT_SHARPE = 0.5    # the last ~2 years must still be clearly profitable
 MAX_CORRELATION = 0.7      # same cutoff BRAIN uses for self-correlation
 REPAIRABLE = {"CONCENTRATED_WEIGHT"}  # failures worth a repair attempt when everything else is strong
+SEND_MAX_CORRELATION = 0.6  # Telegram only gets alphas below this PnL correlation with submitted/already-sent ones
+
+# Automatic submission (permanent!): only Recommended alphas, a few per BRAIN day, re-verified right before.
+AUTO_SUBMIT = os.environ.get("MINER_AUTO_SUBMIT", "off").lower() in ("on", "true", "1", "yes")
+SUBMITS_PER_DAY = int(os.environ.get("MINER_SUBMITS_PER_DAY", 5))   # manual submissions count toward it
+AUTO_MIN_FITNESS = float(os.environ.get("MINER_AUTO_MIN_FITNESS", 1.2))
 MIN_FIELD_COVERAGE = 0.3
 FIELDS_MAX_AGE_DAYS = 7
 SCOPE = {"region": "USA", "delay": 1, "universe": "TOP3000"}
@@ -59,6 +65,7 @@ SEEDS = DIR / "seeds.json"         # researched ideas, tried before the generic 
 STATE = DIR / "state.json"         # daily simulation counter
 REPORT = DIR / "report.json"       # day of the last Telegram daily report
 REPORTED = DIR / "reported.json"   # every alpha already run through the official check for Telegram
+SENT = DIR / "sent.json"           # alphas sent to the user (fitness, idea code), to keep new messages distinct
 NEW_READY = DIR / "new_ready.md"   # winners found in this run (used for notifications)
 LOG = DIR / "miner.log"
 LOCK = DIR / "miner.lock"
@@ -210,6 +217,15 @@ def yearly_sharpe(pnl):
     return out
 
 
+def brain_day():
+    """BRAIN's scoring day runs on New York time."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    except Exception:  # no tz database (e.g. bare Windows Python): EDT/EST is UTC-4/-5
+        return (datetime.utcnow() - timedelta(hours=4)).strftime("%Y-%m-%d")
+
+
 def recent_sharpe(pnl, days=504):
     """Sharpe of the last ~2 years: BRAIN also checks recent performance, and it's the best hint of OS behaviour."""
     vals = [pnl[d] for d in sorted(pnl)][-days:]
@@ -244,6 +260,16 @@ class Miner:
         self.run_sims, self.run_winners = 0, 0
         reported = json.loads(REPORTED.read_text(encoding="utf-8")) if REPORTED.exists() else {}
         self.reported = {k: v for k, v in reported.items() if v != "checking"}  # retry checks cut off by a stop
+        # Alphas already sent to the user (to keep later messages distinct from them)
+        if SENT.exists():
+            self.sent = json.loads(SENT.read_text(encoding="utf-8"))
+        else:
+            by_id = {r.get("alphaId"): r for r in self.tried.values()}
+            self.sent = {aid: {"fitness": by_id[aid]["fitness"], "sharpe": by_id[aid]["sharpe"],
+                               "code": idea_code(by_id[aid]["expr"])}
+                         for aid, v in self.reported.items() if v in ("pass", "passed") and aid in by_id}
+        self.sent_pnls = {}
+        self.submit_lock = threading.Lock()
 
     # ---- inputs ---------------------------------------------------------------------------
     def load_fields(self, force=False):
@@ -487,13 +513,63 @@ class Miner:
             + (f" (replaces {len(rivals)} weaker correlated version)" if rivals else ""))
         if PRIVATE_CONSOLE:
             print(f"*** new alpha ready to submit: {r['alphaId']} Sharpe={r['sharpe']:.2f} Fitness={r['fitness']:.2f}", flush=True)
+        if r["alphaId"] not in self.sent:
+            return True  # not distinct enough to have been sent; don't recommend it either
         self.brain.label(r["alphaId"], ["passing", "recommended", f"idea-{idea_code(r['expr'])}"], favorite=True)
         notify.send(f"⭐ Recommended: {r['alphaId']} (idea {idea_code(r['expr'])})\n"
                     f"The best version of this idea, and it also clears the miner's extra quality gates: "
                     f"stable across settings ({stability:.0%}), at most one losing year, strong last 2 years "
                     f"(Sharpe {recent:.2f}), and distinct from your submitted alphas (max corr {max_corr:.2f}).\n"
                     f"Starred ⭐ in your BRAIN account. Open: {ALPHA_URL.format(r['alphaId'])}")
+        self.try_auto_submit()
         return True
+
+    # ---- automatic submission -------------------------------------------------------------
+    def try_auto_submit(self):
+        """Submit the best Recommended alphas, up to SUBMITS_PER_DAY per BRAIN day (manual submissions count too)."""
+        if not AUTO_SUBMIT or not self.submit_lock.acquire(blocking=False):
+            return
+        try:
+            today = brain_day()
+            done = self.brain.submissions_on(today)
+            if done >= SUBMITS_PER_DAY:
+                return
+            self.refresh_references()
+            with _lock:
+                candidates = sorted((x for x in self.ready if x["alphaId"] in self.sent
+                                     and x["fitness"] >= AUTO_MIN_FITNESS
+                                     and x["alphaId"] not in self.reference_pnls),
+                                    key=lambda x: -x["fitness"])
+            for c in candidates:
+                if done >= SUBMITS_PER_DAY:
+                    return
+                aid = c["alphaId"]
+                pnl = self.sent_pnl(aid)
+                if any(corr(pnl, ref) >= SEND_MAX_CORRELATION for ref in self.reference_pnls.values()):
+                    continue  # became too similar to something submitted since it was found
+                failed = [x["name"] for x in self.brain.check(aid).get("is", {}).get("checks", [])
+                          if x.get("result") == "FAIL"]
+                if failed:
+                    log(f"  auto-submit skipped {aid}: official check now fails {failed}")
+                    continue
+                ok, detail = self.brain.submit(aid)
+                if ok:
+                    done += 1
+                    self.reference_pnls[aid] = pnl
+                    with _lock:
+                        self.ready = [x for x in self.ready if x["alphaId"] != aid]
+                        write_json(READY, self.ready)
+                    log(f"*** auto-submitted {aid}", public=True)
+                    notify.send(f"🚀 Submitted automatically: {aid} ({done}/{SUBMITS_PER_DAY} today, New York time)\n"
+                                f"Sharpe {c['sharpe']:.2f} · Fitness {c['fitness']:.2f} · data: {c.get('dataset')}\n"
+                                f"{ALPHA_URL.format(aid)}")
+                else:
+                    log(f"  auto-submit of {aid} failed: {detail}", public=True)
+                    notify.send(f"⚠️ Tried to submit {aid} automatically but BRAIN said: {detail}")
+        except requests.RequestException as e:
+            log(f"auto-submit postponed: {type(e).__name__}", public=True)
+        finally:
+            self.submit_lock.release()
 
     # ---- Telegram: every alpha that passes BRAIN's checks -------------------------------
     def report_pass(self, r):
@@ -505,33 +581,73 @@ class Miner:
             self.reported[aid] = "checking"
         checks = self.brain.check(aid).get("is", {}).get("checks", [])
         failed = [c["name"] for c in checks if c.get("result") == "FAIL"]
-        self_corr = next((c.get("value") for c in checks if c.get("name") == "SELF_CORRELATION"), None)
-        if not failed:
-            self.brain.label(aid, ["passing", f"idea-{idea_code(r['expr'])}"])
-        with _lock:
-            self.reported[aid] = ("fail:" + ",".join(failed)) if failed else "passed"
-            write_json(REPORTED, self.reported)
         if failed:
+            self._mark(aid, "fail:" + ",".join(failed))
             log(f"  {aid} passed the simulation checks but failed the official check: {failed}")
             return
+
+        # Only genuinely new ideas reach the user: BRAIN lets a near-copy pass if its Sharpe is 10% higher,
+        # but submitting near-copies wastes ideas and drags the day's quality score down.
+        self.refresh_references()  # include anything submitted since the last refresh
         pnl = self.brain.daily_pnl(aid)
-        years, recent = yearly_sharpe(pnl), recent_sharpe(pnl)
         corrs = {sid: corr(pnl, ref) for sid, ref in self.reference_pnls.items()}
         closest = max(corrs, key=corrs.get) if corrs else None
+        if closest and corrs[closest] >= SEND_MAX_CORRELATION:
+            self._mark(aid, f"similar-to-submitted:{closest}")
+            log(f"  {aid} not sent: {corrs[closest]:.2f} correlated with your submitted alpha {closest}")
+            return
+        replaces, max_pending = None, 0.0
+        for sid, info in list(self.sent.items()):
+            if sid in self.reference_pnls:
+                continue  # already submitted: covered by the check above
+            c = corr(pnl, self.sent_pnl(sid))
+            if c >= SEND_MAX_CORRELATION:
+                if (r["fitness"] or 0) <= info["fitness"]:
+                    self._mark(aid, f"weaker-than-sent:{sid}")
+                    log(f"  {aid} not sent: a better version ({sid}) was already sent")
+                    return
+                replaces = replaces or sid
+            else:
+                max_pending = max(max_pending, c)
+
+        code = idea_code(r["expr"])
+        self.brain.label(aid, ["passing", f"idea-{code}"])
+        with _lock:
+            if replaces:
+                self.sent.pop(replaces, None)
+            self.sent[aid] = {"fitness": r["fitness"], "sharpe": r["sharpe"], "code": code}
+            self.sent_pnls[aid] = pnl
+            write_json(SENT, self.sent)
+        if replaces:
+            self.brain.request("PATCH", f"/alphas/{replaces}", json={"tags": ["passing", "superseded"]})
+        self._mark(aid, "passed")
+
+        years, recent = yearly_sharpe(pnl), recent_sharpe(pnl)
         s = r["settings"]
         years_txt = " ".join(f"{y[2:]}:{v:+.1f}" for y, v in years.items())
         log(f"  PASS sent to Telegram: {aid} {r['expr']}")
-        notify.send(f"✅ Passing alpha: {aid}\n"
-                    f"Idea {idea_code(r['expr'])} · data: {r.get('dataset') or 'unknown'}\n"
+        notify.send((f"🔁 Better version of {replaces}: use {aid} instead (don't submit both)\n\n" if replaces else "")
+                    + f"✅ Passing alpha: {aid}\n"
+                    f"Idea {code} · data: {r.get('dataset') or 'unknown'}\n"
                     f"Sharpe {r['sharpe']:.2f} · Fitness {r['fitness']:.2f} · Turnover {r['turnover']*100:.1f}%\n"
                     f"Returns {r['returns']*100:.1f}% · Drawdown {r['drawdown']*100:.1f}%\n"
                     f"Yearly Sharpe {years_txt} · last 2y {recent:.2f}\n"
-                    f"BRAIN self-correlation {self_corr}"
-                    + (f" · closest submitted: {closest} ({corrs[closest]:.2f})" if closest else "") + "\n"
+                    f"Distinct: max correlation {corrs[closest] if closest else 0:.2f} with your submitted alphas"
+                    + (f" ({closest})" if closest else "")
+                    + f", {max_pending:.2f} with other alphas sent to you\n"
                     f"Settings: {s['neutralization']}, decay {s['decay']}, truncation {s['truncation']}\n"
-                    f"Same idea code = near-copies: submit at most one per code.\n"
                     f"Open: {ALPHA_URL.format(aid)}\n"
-                    f"Or in BRAIN: Alphas → Unsubmitted → search \"{aid}\" (or filter by tag \"passing\")")
+                    f"Or in BRAIN: Alphas → Unsubmitted → search \"{aid}\"")
+
+    def _mark(self, aid, status):
+        with _lock:
+            self.reported[aid] = status
+            write_json(REPORTED, self.reported)
+
+    def sent_pnl(self, aid):
+        if aid not in self.sent_pnls:
+            self.sent_pnls[aid] = self.brain.daily_pnl(aid)
+        return self.sent_pnls[aid]
 
     def report_backlog(self):
         """Send passing alphas found before Telegram reporting existed (or cut off by a stop); label older passes."""
@@ -611,6 +727,7 @@ class Miner:
         for t in threads:
             t.start()
         threading.Thread(target=self.report_backlog, daemon=True).start()
+        threading.Thread(target=self.try_auto_submit, daemon=True).start()
         last_refresh = time.time()
         stopped_at = None
         while any(t.is_alive() for t in threads):
@@ -631,6 +748,7 @@ class Miner:
                     self.refresh_references()
                 except requests.RequestException as e:
                     log(f"refresh failed: {e}", public=True)
+                threading.Thread(target=self.try_auto_submit, daemon=True).start()  # e.g. a new BRAIN day began
         self.daily_report()
         log(f"run finished: {self.run_sims} simulations, {self.run_winners} new alphas ready, "
             f"{len(self.ready)} on the ready list, {len(self.families)} families still tuning", public=True)

@@ -54,6 +54,10 @@ jobs:
         env:
           MINER_MINUTES: ${{ inputs.minutes || vars.MINER_MINUTES || '320' }}
           MINER_MAX_SIMS_PER_DAY: ${{ vars.MINER_MAX_SIMS_PER_DAY || '600' }}
+          # Automatic submission: set the repository variable MINER_AUTO_SUBMIT to "off" to stop it.
+          MINER_AUTO_SUBMIT: ${{ vars.MINER_AUTO_SUBMIT || 'on' }}
+          MINER_SUBMITS_PER_DAY: ${{ vars.MINER_SUBMITS_PER_DAY || '5' }}
+          MINER_AUTO_MIN_FITNESS: ${{ vars.MINER_AUTO_MIN_FITNESS || '1.2' }}
         run: python miner.py
 
       - name: Save progress
