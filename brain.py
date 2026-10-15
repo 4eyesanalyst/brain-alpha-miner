@@ -18,6 +18,7 @@ import requests
 
 API = "https://api.worldquantbrain.com"
 CONCURRENCY = 3
+SIM_TIMEOUT = 30 * 60   # give up on a simulation that hasn't finished in 30 minutes
 RESULTS = Path(__file__).parent / "results" / "simulations.jsonl"
 
 DEFAULT_SETTINGS = {
@@ -91,12 +92,15 @@ class Brain:
             return {**result, "error": f"submit HTTP {res.status_code}: {res.text}"}
         progress = res.headers["Location"]
 
+        deadline = time.time() + SIM_TIMEOUT
         while True:
             r = self.request("GET", progress)
             retry = float(r.headers.get("Retry-After", 0))
             sim = r.json()
             if not retry:
                 break
+            if time.time() > deadline:
+                return {**result, "error": f"simulation still running after {SIM_TIMEOUT // 60} min; skipped"}
             time.sleep(retry)
         if sim.get("status") != "COMPLETE" or not sim.get("alpha"):
             return {**result, "error": sim.get("message") or sim.get("status")}
@@ -110,12 +114,16 @@ class Brain:
             "checks": [{k: c.get(k) for k in ("name", "result", "value", "limit")} for c in stats.get("checks", [])],
         }
 
-    def _poll(self, url):
+    def _poll(self, url, timeout=600):
+        """GET a resource BRAIN computes on demand, waiting while it says Retry-After (at most `timeout` s)."""
+        deadline = time.time() + timeout
         while True:
             r = self.request("GET", url)
             retry = float(r.headers.get("Retry-After", 0))
             if not retry and r.text:
                 return r.json()
+            if time.time() > deadline:
+                raise requests.Timeout(f"{url} not ready after {timeout} s")
             time.sleep(retry or 5)
 
     def daily_pnl(self, alpha_id):
@@ -150,17 +158,19 @@ class Brain:
             if offset >= page.get("count", 0):
                 return fields
 
+    def label(self, alpha_id, tags, favorite=False):
+        """Name the alpha after its ID (BRAIN's search looks at names, not IDs), tag it and colour it green."""
+        body = {"name": alpha_id, "tags": tags, "color": "GREEN"}
+        if favorite:
+            body["favorite"] = True
+        return self.request("PATCH", f"/alphas/{alpha_id}", json=body).ok
+
     def submitted_alphas(self):
         return self.request("GET", "/users/self/alphas", params={"status": "ACTIVE", "limit": 100}).json().get("results", [])
 
     def check(self, alpha_id):
         """Run the full pre-submission check (incl. self/prod correlation) — same as 'Check Submission'."""
-        while True:
-            r = self.request("GET", f"/alphas/{alpha_id}/check")
-            retry = float(r.headers.get("Retry-After", 0))
-            if not retry and r.text:
-                return r.json()
-            time.sleep(retry or 5)
+        return self._poll(f"/alphas/{alpha_id}/check", timeout=900)
 
 
 def summarize(r):

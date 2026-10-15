@@ -36,6 +36,8 @@ from brain import Brain, CONCURRENCY, DEFAULT_SETTINGS, summarize
 
 # ---- knobs (environment variables override the defaults) ------------------------------------
 MINUTES = int(os.environ.get("MINER_MINUTES", 0))                     # 0 = run forever
+STOP_GRACE = 8 * 60        # after time is up, wait at most this long for in-flight work
+ALPHA_URL = "https://platform.worldquantbrain.com/alpha/{}"
 MAX_SIMS_PER_DAY = int(os.environ.get("MINER_MAX_SIMS_PER_DAY", 600))  # BRAIN asks for low-intensity API use
 MIN_FITNESS = 1.0          # submission cutoff for Delay 1
 PROMISING_SHARPE = 1.0     # stage-1 |Sharpe| that earns a tuning family
@@ -485,10 +487,12 @@ class Miner:
             + (f" (replaces {len(rivals)} weaker correlated version)" if rivals else ""))
         if PRIVATE_CONSOLE:
             print(f"*** new alpha ready to submit: {r['alphaId']} Sharpe={r['sharpe']:.2f} Fitness={r['fitness']:.2f}", flush=True)
+        self.brain.label(r["alphaId"], ["passing", "recommended", f"idea-{idea_code(r['expr'])}"], favorite=True)
         notify.send(f"⭐ Recommended: {r['alphaId']} (idea {idea_code(r['expr'])})\n"
                     f"The best version of this idea, and it also clears the miner's extra quality gates: "
                     f"stable across settings ({stability:.0%}), at most one losing year, strong last 2 years "
-                    f"(Sharpe {recent:.2f}), and distinct from your submitted alphas (max corr {max_corr:.2f}).")
+                    f"(Sharpe {recent:.2f}), and distinct from your submitted alphas (max corr {max_corr:.2f}).\n"
+                    f"Starred ⭐ in your BRAIN account. Open: {ALPHA_URL.format(r['alphaId'])}")
         return True
 
     # ---- Telegram: every alpha that passes BRAIN's checks -------------------------------
@@ -502,8 +506,10 @@ class Miner:
         checks = self.brain.check(aid).get("is", {}).get("checks", [])
         failed = [c["name"] for c in checks if c.get("result") == "FAIL"]
         self_corr = next((c.get("value") for c in checks if c.get("name") == "SELF_CORRELATION"), None)
+        if not failed:
+            self.brain.label(aid, ["passing", f"idea-{idea_code(r['expr'])}"])
         with _lock:
-            self.reported[aid] = ("fail:" + ",".join(failed)) if failed else "pass"
+            self.reported[aid] = ("fail:" + ",".join(failed)) if failed else "passed"
             write_json(REPORTED, self.reported)
         if failed:
             log(f"  {aid} passed the simulation checks but failed the official check: {failed}")
@@ -524,10 +530,18 @@ class Miner:
                     + (f" · closest submitted: {closest} ({corrs[closest]:.2f})" if closest else "") + "\n"
                     f"Settings: {s['neutralization']}, decay {s['decay']}, truncation {s['truncation']}\n"
                     f"Same idea code = near-copies: submit at most one per code.\n"
-                    f"Submit: BRAIN → Alphas → Unsubmitted → {aid}")
+                    f"Open: {ALPHA_URL.format(aid)}\n"
+                    f"Or in BRAIN: Alphas → Unsubmitted → search \"{aid}\" (or filter by tag \"passing\")")
 
     def report_backlog(self):
-        """Send passing alphas found before Telegram reporting existed (or cut off by a stop)."""
+        """Send passing alphas found before Telegram reporting existed (or cut off by a stop); label older passes."""
+        for aid, status in list(self.reported.items()):
+            if status == "pass":  # reported before labelling existed
+                rec = next((r for r in self.tried.values() if r.get("alphaId") == aid), None)
+                if rec and self.brain.label(aid, ["passing", f"idea-{idea_code(rec['expr'])}"]):
+                    with _lock:
+                        self.reported[aid] = "passed"
+                        write_json(REPORTED, self.reported)
         backlog = [r for r in list(self.tried.values()) if passes_is(r) and r["alphaId"] not in self.reported]
         for r in sorted(backlog, key=lambda r: -(r["fitness"] or 0)):
             if self.stop.is_set():
@@ -598,11 +612,19 @@ class Miner:
             t.start()
         threading.Thread(target=self.report_backlog, daemon=True).start()
         last_refresh = time.time()
+        stopped_at = None
         while any(t.is_alive() for t in threads):
             time.sleep(15)
             if deadline and time.time() >= deadline and not self.stop.is_set():
                 log("time is up; finishing the simulations in flight", public=True)
                 self.stop.set()
+            if self.stop.is_set():
+                stopped_at = stopped_at or time.time()
+                if time.time() - stopped_at > STOP_GRACE:
+                    # Everything finished so far is already on disk; leave stragglers so the run can save in time.
+                    log(f"wind-down took over {STOP_GRACE // 60} min; leaving the remaining work for the next run",
+                        public=True)
+                    break
             if time.time() - last_refresh > 3600:
                 last_refresh = time.time()
                 try:

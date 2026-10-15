@@ -13,7 +13,7 @@ on:
     inputs:
       minutes:
         description: "How many minutes to mine"
-        default: "330"
+        default: "320"
 
 permissions:
   contents: write   # commit the encrypted progress
@@ -34,7 +34,11 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
     steps:
+      # Always the newest main, not the commit that triggered the run: a queued scheduled run would
+      # otherwise restore stale progress from before the previous run saved.
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - uses: actions/setup-python@v5
         with:
@@ -48,25 +52,32 @@ jobs:
 
       - name: Mine alphas
         env:
-          MINER_MINUTES: ${{ inputs.minutes || vars.MINER_MINUTES || '330' }}
+          MINER_MINUTES: ${{ inputs.minutes || vars.MINER_MINUTES || '320' }}
           MINER_MAX_SIMS_PER_DAY: ${{ vars.MINER_MAX_SIMS_PER_DAY || '600' }}
         run: python miner.py
 
       - name: Save progress
         if: always()
+        # Only this workflow writes miner_state.enc (one run at a time), so this run's state always wins:
+        # commit it on top of the newest main instead of rebasing, which can't conflict.
         run: |
           python vault.py pack
+          cp miner_state.enc "$RUNNER_TEMP/state.enc"
           git config user.name "alpha-miner[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add miner_state.enc
-          if ! git diff --cached --quiet; then
-            git commit -m "miner: progress $(date -u '+%Y-%m-%d %H:%M') UTC"
-            git pull --rebase
-            git push
-          fi
+          for attempt in 1 2 3; do
+            git fetch -q origin main
+            git checkout -q -f origin/main
+            cp "$RUNNER_TEMP/state.enc" miner_state.enc
+            git add miner_state.enc
+            git diff --cached --quiet && break
+            git commit -q -m "miner: progress $(date -u '+%Y-%m-%d %H:%M') UTC"
+            git push -q origin HEAD:main && break
+            sleep 5
+          done
 
       - name: Alert on failure
-        if: failure()
+        if: failure() || cancelled()
         run: >
           python notify.py send "🔴 Alpha miner run failed. Details:
           ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
