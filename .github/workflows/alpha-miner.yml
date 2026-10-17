@@ -1,23 +1,28 @@
 # Runs the alpha miner on GitHub's servers around the clock — no local PC needed.
 #
-# A job may run at most 6 hours, so a run starts every 6 hours and mines for ~5.5 hours
-# (MINER_MINUTES). Each run decrypts the saved state, mines, re-encrypts it into
-# miner_state.enc and commits it, so the next run resumes exactly where this one stopped.
-# The repository is public: formulas never appear in logs, issues or plain files.
+# A job may run at most 6 hours, so each run mines for ~5.6 hours (MINER_MINUTES), saves, and then
+# starts the next run itself, so mining continues 24/7. The 6-hourly schedule is only a safety net
+# that restarts the chain if it ever breaks (e.g. after a failed login). Each run decrypts the saved
+# state, mines, re-encrypts it into miner_state.enc and commits it, so the next run resumes exactly
+# where this one stopped. The repository is public: formulas never appear in logs, issues or files.
+#
+# Stop it: set the repository variable MINER_CHAIN to "off" (stops the chain) and/or disable the
+# workflow under Actions.
 name: alpha-miner
 
 on:
   schedule:
-    - cron: "7 */6 * * *"    # 00:07, 06:07, 12:07, 18:07 UTC
+    - cron: "7 */6 * * *"    # safety net; the chain normally keeps it running continuously
   workflow_dispatch:
     inputs:
       minutes:
         description: "How many minutes to mine"
-        default: "320"
+        default: "335"
 
 permissions:
   contents: write   # commit the encrypted progress
   issues: write     # announce new alphas
+  actions: write    # start the next run in the chain
 
 concurrency:
   group: alpha-miner
@@ -26,7 +31,7 @@ concurrency:
 jobs:
   mine:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 358
     env:
       BRAIN_EMAIL: ${{ secrets.BRAIN_EMAIL }}
       BRAIN_PASSWORD: ${{ secrets.BRAIN_PASSWORD }}
@@ -52,12 +57,9 @@ jobs:
 
       - name: Mine alphas
         env:
-          MINER_MINUTES: ${{ inputs.minutes || vars.MINER_MINUTES || '320' }}
-          MINER_MAX_SIMS_PER_DAY: ${{ vars.MINER_MAX_SIMS_PER_DAY || '600' }}
-          # Automatic submission: set the repository variable MINER_AUTO_SUBMIT to "off" to stop it.
-          MINER_AUTO_SUBMIT: ${{ vars.MINER_AUTO_SUBMIT || 'on' }}
-          MINER_SUBMITS_PER_DAY: ${{ vars.MINER_SUBMITS_PER_DAY || '5' }}
-          MINER_AUTO_MIN_FITNESS: ${{ vars.MINER_AUTO_MIN_FITNESS || '1.2' }}
+          MINER_MINUTES: ${{ inputs.minutes || vars.MINER_MINUTES || '335' }}
+          MINER_MAX_SIMS_PER_DAY: ${{ vars.MINER_MAX_SIMS_PER_DAY || '5000' }}
+          MINER_TELEGRAM: ${{ vars.MINER_TELEGRAM || 'all' }}
         run: python miner.py
 
       - name: Save progress
@@ -79,6 +81,13 @@ jobs:
             git push -q origin HEAD:main && break
             sleep 5
           done
+
+      # Keep mining 24/7: queue the next run (only after a healthy run, so a broken login can't loop).
+      - name: Start the next run
+        if: success() && vars.MINER_CHAIN != 'off'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run alpha-miner.yml --repo "${{ github.repository }}" --ref main
 
       - name: Alert on failure
         if: failure() || cancelled()

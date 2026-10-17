@@ -213,7 +213,7 @@ and maximum correlation, so you can see *why* it was accepted.
 These are honest estimates; the real numbers build up in `miner/tried.jsonl` over the first days.
 
 - **Throughput:** each simulation takes about 1–2 minutes on BRAIN's side, with 3 running in parallel. That's
-  roughly 80–100 simulations per hour of mining, up to the daily cap (`MINER_MAX_SIMS_PER_DAY`, default 600).
+  roughly 80–100 simulations per hour of mining, around the clock in the cloud (about 2,000–2,400 a day).
   Running 24/7 in the cloud, the cap is reached most days. Runs that start after the cap is used up exit
   immediately and cost almost nothing.
 - **Hit rate:** most raw screens fail. Typically only a few percent of fields reach |Sharpe| ≥ 1, and only a
@@ -225,7 +225,7 @@ These are honest estimates; the real numbers build up in `miner/tried.jsonl` ove
 - **What it will *not* do:** guarantee out-of-sample performance (no one can), produce Spectacular alphas on
   demand, or submit for you. Submitting is permanent, so a human decides.
 - **The search space is finite:** with the current templates, a full pass over all ~4,000 fields is roughly
-  25,000 screens plus tuning, about 6–8 weeks at the daily cap. When everything has been tried, the miner idles and
+  25,000 screens plus tuning, about 2–3 weeks running 24/7. When everything has been tried, the miner idles and
   re-checks for new datasets every 6 hours. At that point the best upgrade is new templates in `TEMPLATES`.
 
 ## 6. Setup: running it in the cloud (GitHub Actions)
@@ -246,9 +246,12 @@ These are honest estimates; the real numbers build up in `miner/tried.jsonl` ove
 
    Winners are also posted as a GitHub issue at the end of each run, which GitHub emails to you.
 
-**Schedule and minutes.** GitHub limits a job to 6 hours, so a run starts at 00:07, 06:07, 12:07 and 18:07 UTC
-and mines for about 5.5 hours (`MINER_MINUTES`, default 330). Public repositories get unlimited free Actions
-minutes. GitHub pauses scheduled workflows in a repository with no activity for 60 days. The miner's own commits count
+**Running 24/7.** GitHub limits a job to 6 hours, so each run mines for about 5.6 hours (`MINER_MINUTES`,
+default 335), saves its progress, and then **starts the next run itself**, so mining is continuous. The 6-hourly
+schedule is only a safety net that restarts the chain if it ever breaks (for example after a failed login).
+GitHub often starts scheduled runs late, which is why the chain doesn't rely on the schedule. To pause mining,
+set the repository variable `MINER_CHAIN` to `off` or disable the workflow under *Actions*. Public repositories
+get unlimited free Actions minutes. GitHub pauses scheduled workflows in a repository with no activity for 60 days. The miner's own commits count
 as activity, but if it ever stops, re-enable it under *Actions*.
 
 **Identity check.** BRAIN sometimes asks for a one-off identity check when a login comes from a new location,
@@ -263,27 +266,27 @@ and re-run the workflow.
 | Formulas, simulation history, ready list, full log | Only inside `miner_state.enc` (encrypted with `MINER_STATE_KEY`) |
 | Actions run logs | Public, but in the cloud the miner prints only counts, Sharpe/Fitness numbers and alpha IDs |
 | Notification issues | Public: alpha IDs and statistics only. An alpha ID can be opened only from the owner's BRAIN account |
-| Telegram messages | Private chat with your bot: alpha IDs, statistics, run links, identity-check links, auto-submissions. Never formulas |
+| Telegram messages | Private chat with your bot: alpha IDs, statistics, run links, identity-check links. Never formulas |
 | BRAIN password | GitHub Secrets only (encrypted and masked in logs) |
 
 ## 7. Daily routine: submitting alphas
 
-**What reaches Telegram.** Every alpha that passes BRAIN's official check *and* is genuinely new: its daily-PnL
-correlation is below **0.6** with every alpha you've submitted (no "10% better Sharpe" exception) and with every
-alpha already sent to you that you haven't submitted yet. If a new alpha is a *better* version of one already sent,
-it arrives as "🔁 use this instead". Weaker versions are dropped silently. So any alpha in your Telegram can be
-submitted without correlation problems. Each sent alpha is also labelled in BRAIN: named after its ID, tagged
-`passing` and `idea-XXXXX`, and coloured green.
+**What reaches Telegram.** Every alpha that passes BRAIN's official pre-submission check (`MINER_TELEGRAM=all`,
+the default). Each message starts with how it relates to what you already have:
 
-**Automatic submission** (on by default; set the repository variable `MINER_AUTO_SUBMIT` to `off` to stop it).
-The miner submits by itself:
-- only ⭐ Recommended alphas (all gates passed) that were sent to you, with Fitness ≥ `MINER_AUTO_MIN_FITNESS` (1.2);
-- at most `MINER_SUBMITS_PER_DAY` (5) per BRAIN day (New York time). Your manual submissions count toward the limit;
-- only after re-running BRAIN's official check and the correlation check at that moment;
-- each submission (or failure) is announced on Telegram: "🚀 Submitted automatically …".
+| Header | Meaning | What to do |
+|---|---|---|
+| 🆕 New idea | Correlation below 0.6 with every alpha you've submitted or been sent | Good candidate |
+| 🔁 Better version of X | Same idea as X (sent earlier) but stronger | Submit only one of the two: this one |
+| 🔂 Same idea as X | Same idea as X (sent earlier), not stronger | Submit only one of the two |
+| ⚠️ Near-copy of your submitted X | Correlation ≥ 0.6 with an alpha you already submitted | Usually skip: adds little |
+
+Setting `MINER_TELEGRAM=distinct` sends only 🆕 and 🔁 messages instead. Each sent alpha is labelled in BRAIN:
+named after its ID, tagged `passing` and `idea-XXXXX`, and coloured green. Nothing is ever submitted
+automatically. You decide.
 
 Note: the Challenge caps a day's score at 2,000, which 1–2 strong alphas usually reach. Extra submissions on the
-same day don't add points but do use up ideas, so a lower limit spreads ideas across more scoring days.
+same day don't add points but do use up ideas, so 1–2 distinct alphas a day earn the most over time.
 
 **Doing it by hand:**
 
@@ -316,11 +319,10 @@ work from different copies of the progress and overwrite each other. Disable the
 
 | Setting | Where | Default | Effect |
 |---|---|---|---|
-| `MINER_MINUTES` | env / repository variable | `0` locally (forever), `330` in Actions | Mine this long, then save and exit |
-| `MINER_MAX_SIMS_PER_DAY` | env / repository variable | `600` | Daily simulation cap |
-| `MINER_AUTO_SUBMIT` | env / repository variable | `off` locally, `on` in Actions | Submit Recommended alphas automatically |
-| `MINER_SUBMITS_PER_DAY` | env / repository variable | `5` | Daily submission limit (manual submissions count) |
-| `MINER_AUTO_MIN_FITNESS` | env / repository variable | `1.2` | Minimum Fitness for automatic submission |
+| `MINER_MINUTES` | env / repository variable | `0` locally (forever), `335` in Actions | Mine this long, then save and exit (and start the next run) |
+| `MINER_CHAIN` | repository variable | `on` | `off` stops the 24/7 chain of runs |
+| `MINER_TELEGRAM` | env / repository variable | `all` | `all` = every passing alpha; `distinct` = only new ideas and better versions |
+| `MINER_MAX_SIMS_PER_DAY` | env / repository variable | `600` locally, `5000` in Actions | Daily simulation cap (in the cloud it's effectively time-limited) |
 | `MIN_FITNESS`, `MIN_STABILITY`, `MAX_BAD_YEARS`, `MIN_RECENT_SHARPE`, `MAX_CORRELATION` | top of `miner.py` | 1.0, 0.34, 1, 0.5, 0.7 | Strictness of the gates |
 | `TEMPLATES`, `CATEGORY_SETTINGS`, `tune_decays`, `TRAP_FIELDS` | `miner.py` | see file | The idea space being searched |
 | Seed ideas | `miner/seeds.json` (encrypted) | ~50 researched signals | Tried before the generic templates |
@@ -329,7 +331,8 @@ work from different copies of the progress and overwrite each other. Disable the
 ## 10. Limits, risks and rules
 
 - **BRAIN API rules:** WorldQuant permits programmatic access "when API communication is conducted with low
-  intensity". The concurrency limit (3) and daily cap (600) are deliberately conservative. Don't raise them aggressively.
+  intensity". The miner never runs more than 3 simulations at once, but running 24/7 means roughly 4× the volume of the
+  original 600/day setting. If BRAIN ever complains or throttles, set `MINER_MAX_SIMS_PER_DAY` (e.g. `600`).
 - **GitHub Actions rules:** GitHub expects Actions to be used for the repository's own software. Here the workflow
   runs this repository's program. If GitHub ever objects, the same code runs unchanged on any small Linux server
   (e.g. Oracle Cloud *Always Free*): `pip install -r requirements.txt`, set the three environment variables, run
