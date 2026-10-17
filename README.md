@@ -121,6 +121,13 @@ with coverage of at least 30%, about **4,000 fields**. The fields are interleave
 first (fewest existing alphas on BRAIN), so the search spreads over all the data early and favours fields that
 other users rarely touch. Those fields are less likely to be correlated with existing alphas.
 
+**Search areas (scopes).** Every idea is screened in several region/delay/universe combinations, interleaved so
+all of them progress: `USA/D1/TOP3000`, `USA/D1/TOP1000`, `USA/D0/TOP3000` and `USA/D1/TOP500` by default
+(`MINER_SCOPES`). Smaller universes score more in the Challenge. Delay 0 is a separate pool of alphas with stricter
+cutoffs (Sharpe > 2, Fitness > 1.3). In addition, every alpha that passes on TOP3000 is automatically re-tried on
+TOP1000 and TOP500, and Telegram flags those versions with 📉. Each scope has its own field catalogue
+(`miner/fields*.json`), and tuning variants stay in their idea's scope.
+
 **2. Stage 1: screening.** First come the **seed ideas**: about 50 signals taken from research, including the academic
 anomaly literature, WorldQuant's own *101 Formulaic Alphas* paper, BRAIN's documentation, and alphas the
 BRAIN community has published along with their stats. Seeds are kept in `miner/seeds.json`, inside the
@@ -326,7 +333,7 @@ work from different copies of the progress and overwrite each other. Disable the
 | `MIN_FITNESS`, `MIN_STABILITY`, `MAX_BAD_YEARS`, `MIN_RECENT_SHARPE`, `MAX_CORRELATION` | top of `miner.py` | 1.0, 0.34, 1, 0.5, 0.7 | Strictness of the gates |
 | `TEMPLATES`, `CATEGORY_SETTINGS`, `tune_decays`, `TRAP_FIELDS` | `miner.py` | see file | The idea space being searched |
 | Seed ideas | `miner/seeds.json` (encrypted) | ~50 researched signals | Tried before the generic templates |
-| `SCOPE` | `miner.py` | USA / D1 / TOP3000 | Region, delay, universe |
+| `MINER_SCOPES` | env / repository variable | `USA/1/TOP3000,USA/1/TOP1000,USA/0/TOP3000,USA/1/TOP500` | Search areas (region/delay/universe), interleaved |
 
 ## 10. Limits, risks and rules
 

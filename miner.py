@@ -50,13 +50,30 @@ SEND_MAX_CORRELATION = 0.6  # above this PnL correlation an alpha counts as a ne
 # "all": every alpha passing BRAIN's official check goes to Telegram (near-copies flagged).
 # "distinct": near-copies of submitted/already-sent alphas are held back.
 TELEGRAM_MODE = os.environ.get("MINER_TELEGRAM", "all").lower()
+MIN_FIELD_COVERAGE = 0.3
+FIELDS_MAX_AGE_DAYS = 7
+
+# Where to search: region/delay/universe combinations, interleaved. Smaller universes score more in the
+# Challenge; Delay 0 is a separate pool of alphas (stricter cutoffs: Sharpe > 2, Fitness > 1.3).
+SCOPES = [dict(zip(("region", "delay", "universe"), (r, int(d), u)))
+          for r, d, u in (s.strip().split("/") for s in os.environ.get(
+              "MINER_SCOPES", "USA/1/TOP3000,USA/1/TOP1000,USA/0/TOP3000,USA/1/TOP500").split(","))]
+SMALLER_UNIVERSES = ["TOP1000", "TOP500"]  # a TOP3000 winner is also tried on these
+
+
+def scope_name(scope):
+    return f"{scope['region']}/D{scope['delay']}/{scope['universe']}"
+
+
+def scope_settings(scope):
+    return {"region": scope["region"], "delay": scope["delay"], "universe": scope["universe"]}
 
 
 DIR = Path(__file__).parent / "miner"
 TRIED = DIR / "tried.jsonl"        # one line per simulation ever run (resume + dedupe)
 FAMILIES = DIR / "families.json"   # tuning families still in progress
 READY = DIR / "ready.json"         # alphas worth submitting, best first
-FIELDS = DIR / "fields.json"       # cached field catalogue
+FIELDS = DIR / "fields.json"       # cached field catalogue (USA/D1/TOP3000; other scopes get their own file)
 SEEDS = DIR / "seeds.json"         # researched ideas, tried before the generic templates (kept encrypted)
 STATE = DIR / "state.json"         # daily simulation counter
 REPORT = DIR / "report.json"       # day of the last Telegram daily report
@@ -104,6 +121,12 @@ TRAP_FIELDS = {"adjfactor", "split", "dividend"}
 TRAP_PATTERN = re.compile(r"count|graphrank|revere")
 PRICE_LEVEL_PATTERN = re.compile(r"breakeven|forward_price")  # option prices: only meaningful relative to close
 SUM_VECTOR_PATTERN = re.compile(r"buzz|volume|count|num")      # vectors of counts are summed, scores averaged
+
+
+def fields_path(scope):
+    if (scope["region"], scope["delay"], scope["universe"]) == ("USA", 1, "TOP3000"):
+        return FIELDS  # the original cache file
+    return DIR / f"fields_{scope['region']}_D{scope['delay']}_{scope['universe']}.json"
 
 
 def field_expr(f):
@@ -258,53 +281,61 @@ class Miner:
         self.sent_pnls = {}
 
     # ---- inputs ---------------------------------------------------------------------------
-    def load_fields(self, force=False):
-        if not force and FIELDS.exists() and time.time() - FIELDS.stat().st_mtime < FIELDS_MAX_AGE_DAYS * 86400:
-            return json.loads(FIELDS.read_text(encoding="utf-8"))
+    def load_fields(self, scope, force=False):
+        path = fields_path(scope)
+        if not force and path.exists() and time.time() - path.stat().st_mtime < FIELDS_MAX_AGE_DAYS * 86400:
+            return json.loads(path.read_text(encoding="utf-8"))
         per_dataset = {}
-        for ds in self.brain.datasets(**SCOPE):
+        for ds in self.brain.datasets(**scope):
             try:
-                fs = [f for f in self.brain.data_fields(ds["id"], **SCOPE)
+                fs = [f for f in self.brain.data_fields(ds["id"], **scope)
                       if f["type"] in ("MATRIX", "VECTOR") and (f.get("coverage") or 0) >= MIN_FIELD_COVERAGE]
             except requests.RequestException as e:
-                log(f"fields: {ds['id']} failed: {e}", public=True)
+                log(f"fields: {scope_name(scope)} {ds['id']} failed: {e}", public=True)
                 continue
             # Least-crowded fields first: fewer existing alphas means a better chance of low correlation.
             per_dataset[ds["id"]] = sorted(fs, key=lambda f: f.get("alphaCount") or 0)
-            log(f"fields: {ds['id']:16} {len(fs):5} usable  ({ds['name']})", public=True)
+            log(f"fields: {scope_name(scope)} {ds['id']:16} {len(fs):5} usable  ({ds['name']})", public=True)
         # Round-robin across datasets so every dataset gets explored early.
         ordered = [f for group in itertools.zip_longest(*per_dataset.values()) for f in group if f]
         slim = [{"id": f["id"], "type": f["type"], "coverage": f.get("coverage") or 0,
                  "dataset": f["dataset"]["id"], "category": (f.get("category") or {}).get("id", "")}
                 for f in ordered]
-        write_json(FIELDS, slim)
+        write_json(path, slim)
         return slim
 
+    def _scope_jobs(self, scope, p, seeds):
+        """Stage-1 jobs of one template pass in one scope (region/delay/universe)."""
+        if p == 0:
+            if scope["delay"] != 1:
+                return  # the researched seeds are Delay-1 ideas
+            candidates = [({"dataset": s.get("dataset", "seed"), "category": s.get("category", "")}, s["expr"],
+                           {k: s[k] for k in ("neutralization", "decay", "truncation") if k in s}) for s in seeds]
+        else:
+            candidates = []
+            for f in self.load_fields(scope):
+                x = field_expr(f)
+                if x:
+                    cat = CATEGORY_SETTINGS.get(f["category"], DEFAULT_CATEGORY)
+                    candidates.append((f, x, {"neutralization": cat["neutralizations"][0], "decay": cat["decay"]}))
+        for f, x, settings in candidates:
+            for name, t in TEMPLATES.items():
+                if t["pass"] != p or ("categories" in t and f["category"] not in t["categories"]):
+                    continue
+                yield {"stage": 1, "template": name, "x": x, "dataset": f["dataset"], "category": f["category"],
+                       "expr": t["expr"].format(x=x, w=t["windows"][len(t["windows"]) // 2]),
+                       "settings": {**BASE, **settings, **scope_settings(scope)}}
+
     def _stage1_jobs(self):
-        """Endless stream of untried stage-1 jobs: seeds, then each template pass over all fields, then refresh."""
+        """Endless stream of untried stage-1 jobs: pass by pass, interleaving every scope, then refresh."""
         while True:
             new = 0
-            fields = self.load_fields()
             seeds = json.loads(SEEDS.read_text(encoding="utf-8")) if SEEDS.exists() else []
             for p in PASSES:
-                if p == 0:
-                    candidates = [({"dataset": s.get("dataset", "seed"), "category": s.get("category", "")}, s["expr"],
-                                   {k: s[k] for k in ("neutralization", "decay", "truncation") if k in s}) for s in seeds]
-                else:
-                    candidates = []
-                    for f in fields:
-                        x = field_expr(f)
-                        if x:
-                            cat = CATEGORY_SETTINGS.get(f["category"], DEFAULT_CATEGORY)
-                            candidates.append((f, x, {"neutralization": cat["neutralizations"][0], "decay": cat["decay"]}))
-                for f, x, settings in candidates:
-                    for name, t in TEMPLATES.items():
-                        if t["pass"] != p or ("categories" in t and f["category"] not in t["categories"]):
-                            continue
-                        job = {"stage": 1, "template": name, "x": x, "dataset": f["dataset"], "category": f["category"],
-                               "expr": t["expr"].format(x=x, w=t["windows"][len(t["windows"]) // 2]),
-                               "settings": {**BASE, **settings}}
-                        if key(job["expr"], job["settings"]) not in self.tried:
+                streams = [self._scope_jobs(scope, p, seeds) for scope in SCOPES]
+                for group in itertools.zip_longest(*streams):
+                    for job in group:
+                        if job and key(job["expr"], job["settings"]) not in self.tried:
                             new += 1
                             yield job
             if not new:
@@ -312,7 +343,8 @@ class Miner:
                 until = time.time() + 6 * 3600
                 while time.time() < until:
                     yield None  # tells the worker to idle (never sleep here: the caller holds the lock)
-                self.load_fields(force=True)
+                for scope in SCOPES:
+                    self.load_fields(scope, force=True)
 
     def refresh_references(self):
         submitted = self.brain.submitted_alphas()
@@ -365,11 +397,15 @@ class Miner:
         if sign > 0:
             jobs.append({k: job[k] for k in ("expr", "settings")})  # the stage-1 result itself competes too
         neutralizations = neutralizations_for(job.get("category"), job["settings"]["neutralization"])
+        # Variants stay in the idea's own scope (region/delay/universe) and keep its truncation.
+        keep = {k: job["settings"][k] for k in ("region", "delay", "universe", "truncation") if k in job["settings"]}
         for w, d, n in itertools.product(t["windows"], tune_decays(r.get("turnover")), neutralizations):
             expr = t["expr"].format(x=job["x"], w=w)
             jobs.append({"expr": f"-({expr})" if sign < 0 else expr,
-                         "settings": {**BASE, "neutralization": n, "decay": d}})
-        fid = hashlib.sha1(f"{job['template']}|{job['x']}|{sign}".encode()).hexdigest()[:12]
+                         "settings": {**BASE, **keep, "neutralization": n, "decay": d}})
+        scope_tag = "" if not {"region", "delay", "universe"} & keep.keys() else \
+            "|" + "/".join(str(keep.get(k, "")) for k in ("region", "delay", "universe"))
+        fid = hashlib.sha1(f"{job['template']}|{job['x']}|{sign}{scope_tag}".encode()).hexdigest()[:12]
         with _lock:
             if fid in self.families:
                 return
@@ -576,6 +612,9 @@ class Miner:
             header = "🆕 New idea, different from everything you've submitted or been sent.\n\n"
         years, recent = yearly_sharpe(pnl), recent_sharpe(pnl)
         s = r["settings"]
+        if s.get("universe", "TOP3000") != "TOP3000" and (replaces or sibling):
+            header += (f"📉 This is the {s['universe']} version. The Challenge scores smaller universes higher, "
+                       f"so prefer it over the TOP3000 one if the stats are similar.\n\n")
         years_txt = " ".join(f"{y[2:]}:{v:+.1f}" for y, v in years.items())
         log(f"  PASS sent to Telegram: {aid} {r['expr']}")
         notify.send(header
@@ -587,9 +626,18 @@ class Miner:
                     f"Max correlation {corrs[closest] if closest else 0:.2f} with your submitted alphas"
                     + (f" ({closest})" if closest else "")
                     + f", {max_pending:.2f} with other alphas sent to you\n"
-                    f"Settings: {s['neutralization']}, decay {s['decay']}, truncation {s['truncation']}\n"
+                    f"Settings: {s.get('region', 'USA')} {s.get('universe', 'TOP3000')} · Delay {s.get('delay', 1)} · "
+                    f"{s['neutralization']}, decay {s['decay']}, truncation {s['truncation']}\n"
                     f"Open: {ALPHA_URL.format(aid)}\n"
                     f"Or in BRAIN: Alphas → Unsubmitted → search \"{aid}\"")
+
+        # A TOP3000 winner may also work on smaller universes, which score higher: try it there next.
+        if s.get("universe", "TOP3000") == "TOP3000" and s.get("delay", 1) == 1:
+            with _lock:
+                for u in SMALLER_UNIVERSES:
+                    self.priority.append({"stage": 3, "template": "universe", "x": r["expr"],
+                                          "dataset": r.get("dataset"), "category": r.get("category"),
+                                          "expr": r["expr"], "settings": {**s, "universe": u}})
 
     def _mark(self, aid, status):
         with _lock:
