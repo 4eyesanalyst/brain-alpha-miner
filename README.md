@@ -247,7 +247,8 @@ These are honest estimates; the real numbers build up in `miner/tried.jsonl` ove
    message, then add two more secrets: `TELEGRAM_BOT_TOKEN` (from BotFather) and `TELEGRAM_CHAT_ID`
    (`python notify.py chats` prints it). You then get:
    - 🟢 **New alpha ready**, the moment a winner passes every gate: Alpha ID, Sharpe, Fitness, turnover, settings.
-   - 🔴 **Run failed**, with a link to the run. If BRAIN asks for an identity check, the link comes here
+   - 🔴 **Run failed**: an error stopped a run (with a link to it). ⏹️ **Run stopped** means it was stopped from
+     outside (a manual restart or GitHub's 6-hour limit). Progress is saved and the chain restarts by itself. If BRAIN asks for an identity check, the link comes here
      privately instead of appearing in the public log.
    - ⚪ **Daily report**, once a day: simulations, promising ideas, alphas waiting, ideas being tuned.
 

@@ -90,10 +90,25 @@ jobs:
         run: gh workflow run alpha-miner.yml --repo "${{ github.repository }}" --ref main
 
       - name: Alert on failure
-        if: failure() || cancelled()
+        if: failure()
         run: >
-          python notify.py send "🔴 Alpha miner run failed. Details:
+          python notify.py send "🔴 Alpha miner run failed (an error stopped it). Progress up to the error was saved.
+          Details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # Stopped from outside: a manual restart, or GitHub's 6-hour job limit. Not an error in the miner.
+      - name: Note a stopped run
+        if: cancelled()
+        run: >
+          python notify.py send "⏹️ A miner run was stopped before it finished (a manual restart or GitHub's time limit).
+          Its progress was saved and mining continues. Only worry if this repeats several times a day:
           ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # A cancelled run doesn't start the next one, so restart the chain here (unless paused).
+      - name: Keep the chain going after a stop
+        if: cancelled() && vars.MINER_CHAIN != 'off'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run alpha-miner.yml --repo "${{ github.repository }}" --ref main
 
       - name: Announce new alphas
         if: always() && hashFiles('miner/new_ready.md') != ''
