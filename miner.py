@@ -58,7 +58,7 @@ FIELDS_MAX_AGE_DAYS = 7
 SCOPES = [dict(zip(("region", "delay", "universe"), (r, int(d), u)))
           for r, d, u in (s.strip().split("/") for s in os.environ.get(
               "MINER_SCOPES", "USA/1/TOP3000,USA/1/TOP1000,USA/0/TOP3000,USA/1/TOP500").split(","))]
-SMALLER_UNIVERSES = ["TOP1000", "TOP500"]  # a TOP3000 winner is also tried on these
+SMALLER_UNIVERSES = ["TOP1000", "TOP500", "TOPSP500", "TOP200"]  # a TOP3000 winner is also tried on these
 
 
 def scope_name(scope):
@@ -85,19 +85,30 @@ LOCK = DIR / "miner.lock"
 
 # ---- idea templates -----------------------------------------------------------------------
 # {x} = the prepared field (see field_expr), {w} = lookback window in trading days.
-# Passes run in order over every field: seeds first, then the broadest templates, then the rest.
+# Passes run in order over every field: seeds first, then the change/timing shapes, then levels.
+# tsrank went last on 2026-10-18: ~2,600 simulations of that one shape left new finds failing
+# SELF_CORRELATION against the submitted alphas built from it.
 TEMPLATES = {
     "seed":     {"expr": "{x}", "windows": [None], "pass": 0},   # researched ideas from miner/seeds.json
-    "tsrank":   {"expr": "group_rank(ts_rank({x}, {w}), industry)", "windows": [60, 120, 252], "pass": 1},
-    "zscore":   {"expr": "ts_zscore({x}, {w})", "windows": [60, 126, 252], "pass": 1},
     "revision": {"expr": "group_rank(ts_delta({x}, {w})/(abs(ts_delay({x}, {w})) + 0.0001), industry)",
-                 "windows": [22, 66, 126], "pass": 2, "categories": {"analyst", "fundamental", "model"}},
+                 "windows": [22, 66, 126], "pass": 1, "categories": {"analyst", "fundamental", "model"}},
     "volnorm":  {"expr": "group_rank(ts_delta({x}, {w})/(ts_std_dev({x}, {w}) + 0.0001), subindustry)",
-                 "windows": [22, 66, 252], "pass": 2},
-    "avdiff":   {"expr": "group_neutralize(ts_av_diff({x}, {w}), subindustry)", "windows": [22, 66, 252], "pass": 2},
-    "level":    {"expr": "group_rank({x}, subindustry)", "windows": [None], "pass": 3},
-    "to_cap":   {"expr": "group_rank({x}/cap, subindustry)", "windows": [None], "pass": 3,
+                 "windows": [22, 66, 252], "pass": 1},
+    "avdiff":   {"expr": "group_neutralize(ts_av_diff({x}, {w}), subindustry)", "windows": [22, 66, 252], "pass": 1},
+    # distance from the field's own linear trend (regression residual on a day counter)
+    "detrend":  {"expr": "group_rank(ts_regression({x}, ts_step(1), {w}), industry)", "windows": [60, 120, 252],
+                 "pass": 1},
+    # how recently the field peaked: fresh highs in estimates/news/sentiment lead price
+    "recency":  {"expr": "group_rank(-ts_arg_max({x}, {w}), industry)", "windows": [20, 60, 120], "pass": 1,
+                 "categories": {"analyst", "news", "socialmedia", "option", "model", "pv"}},
+    # only re-trade when volume confirms (the market is reacting), hold otherwise; also cuts turnover
+    "volgate":  {"expr": "trade_when(volume > ts_mean(volume, 20), group_rank(ts_zscore({x}, {w}), industry), -1)",
+                 "windows": [22, 66, 126], "pass": 1},
+    "zscore":   {"expr": "ts_zscore({x}, {w})", "windows": [60, 126, 252], "pass": 2},
+    "level":    {"expr": "group_rank({x}, subindustry)", "windows": [None], "pass": 2},
+    "to_cap":   {"expr": "group_rank({x}/cap, subindustry)", "windows": [None], "pass": 2,
                  "categories": {"fundamental", "analyst"}},
+    "tsrank":   {"expr": "group_rank(ts_rank({x}, {w}), industry)", "windows": [60, 120, 252], "pass": 3},
 }
 PASSES = (0, 1, 2, 3)
 

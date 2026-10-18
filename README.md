@@ -125,24 +125,28 @@ other users rarely touch. Those fields are less likely to be correlated with exi
 all of them progress: `USA/D1/TOP3000`, `USA/D1/TOP1000`, `USA/D0/TOP3000` and `USA/D1/TOP500` by default
 (`MINER_SCOPES`). Smaller universes score more in the Challenge. Delay 0 is a separate pool of alphas with stricter
 cutoffs (Sharpe > 2, Fitness > 1.3). In addition, every alpha that passes on TOP3000 is automatically re-tried on
-TOP1000 and TOP500, and Telegram flags those versions with 📉. Each scope has its own field catalogue
+TOP1000, TOP500, TOPSP500 and TOP200 (the last two came with the Silver level), and Telegram flags those versions with 📉. Each scope has its own field catalogue
 (`miner/fields*.json`), and tuning variants stay in their idea's scope.
 
 **2. Stage 1: screening.** First come the **seed ideas**: about 50 signals taken from research, including the academic
 anomaly literature, WorldQuant's own *101 Formulaic Alphas* paper, BRAIN's documentation, and alphas the
 BRAIN community has published along with their stats. Seeds are kept in `miner/seeds.json`, inside the
 encrypted state, because a seed that passes *is* an alpha formula. Then every field `x` is plugged into the
-generic templates, pass by pass, so the broadest search comes first:
+generic templates, pass by pass. Change and timing shapes come first; `tsrank` comes last, because after about 2,600
+simulations of that one shape its new finds kept failing SELF_CORRELATION against the alphas already submitted:
 
 | Template | Pass | Expression | Idea |
 |---|---|---|---|
-| `tsrank` | 1 | `group_rank(ts_rank(x, w), industry)` | Is `x` high versus its own history, compared with industry peers? (the community's most reliable pattern) |
-| `zscore` | 1 | `ts_zscore(x, w)` | How unusual is today's `x` for this stock? |
-| `revision` | 2 | `group_rank(ts_delta(x, w)/(abs(ts_delay(x, w)) + 0.0001), industry)` | Percentage revision. Analysts and fundamentals drift after revisions |
-| `volnorm` | 2 | `group_rank(ts_delta(x, w)/(ts_std_dev(x, w) + 0.0001), subindustry)` | Change measured in units of its own volatility |
-| `avdiff` | 2 | `group_neutralize(ts_av_diff(x, w), subindustry)` | Distance from its own recent average |
-| `level` | 3 | `group_rank(x, subindustry)` | Is `x` high compared with direct competitors? |
-| `to_cap` | 3 | `group_rank(x/cap, subindustry)` | Fundamental/analyst value per dollar of market cap (a "yield") |
+| `revision` | 1 | `group_rank(ts_delta(x, w)/(abs(ts_delay(x, w)) + 0.0001), industry)` | Percentage revision. Analysts and fundamentals drift after revisions |
+| `volnorm` | 1 | `group_rank(ts_delta(x, w)/(ts_std_dev(x, w) + 0.0001), subindustry)` | Change measured in units of its own volatility |
+| `avdiff` | 1 | `group_neutralize(ts_av_diff(x, w), subindustry)` | Distance from its own recent average |
+| `detrend` | 1 | `group_rank(ts_regression(x, ts_step(1), w), industry)` | Distance from its own linear trend |
+| `recency` | 1 | `group_rank(-ts_arg_max(x, w), industry)` | How recently `x` peaked. Fresh highs in estimates, news or sentiment lead price |
+| `volgate` | 1 | `trade_when(volume > ts_mean(volume, 20), group_rank(ts_zscore(x, w), industry), -1)` | Re-trade only when volume confirms the market is reacting; hold otherwise |
+| `zscore` | 2 | `ts_zscore(x, w)` | How unusual is today's `x` for this stock? |
+| `level` | 2 | `group_rank(x, subindustry)` | Is `x` high compared with direct competitors? |
+| `to_cap` | 2 | `group_rank(x/cap, subindustry)` | Fundamental/analyst value per dollar of market cap (a "yield") |
+| `tsrank` | 3 | `group_rank(ts_rank(x, w), industry)` | Is `x` high versus its own history, compared with industry peers? |
 
 **Preparing a field** (`field_expr`):
 - *Trap fields are skipped:* corporate-action bookkeeping (`adjfactor`, `split`, `dividend`) and static relationship
