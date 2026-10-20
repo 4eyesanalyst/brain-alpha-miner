@@ -91,13 +91,15 @@ LOCK = DIR / "miner.lock"
 TEMPLATES = {
     "seed":     {"expr": "{x}", "windows": [None], "pass": 0},   # researched ideas from miner/seeds.json
     "revision": {"expr": "group_rank(ts_delta({x}, {w})/(abs(ts_delay({x}, {w})) + 0.0001), industry)",
+                 "unitless": "group_rank(ts_delta({x}, {w})/abs(ts_delay({x}, {w})), industry)",
                  "windows": [22, 66, 126], "pass": 1, "categories": {"analyst", "fundamental", "model"}},
     "volnorm":  {"expr": "group_rank(ts_delta({x}, {w})/(ts_std_dev({x}, {w}) + 0.0001), subindustry)",
+                 "unitless": "group_rank(ts_delta({x}, {w})/ts_std_dev({x}, {w}), subindustry)",
                  "windows": [22, 66, 252], "pass": 1},
     "avdiff":   {"expr": "group_neutralize(ts_av_diff({x}, {w}), subindustry)", "windows": [22, 66, 252], "pass": 1},
     # distance from the field's own linear trend (regression residual on a day counter)
     "detrend":  {"expr": "group_rank(ts_regression({x}, ts_step(1), {w}), industry)", "windows": [60, 120, 252],
-                 "pass": 1},
+                 "unitless": "group_rank(ts_regression(ts_zscore({x}, 252), ts_step(1), {w}), industry)", "pass": 1},
     # how recently the field peaked: fresh highs in estimates/news/sentiment lead price
     "recency":  {"expr": "group_rank(-ts_arg_max({x}, {w}), industry)", "windows": [20, 60, 120], "pass": 1,
                  "categories": {"analyst", "news", "socialmedia", "option", "model", "pv"}},
@@ -111,6 +113,11 @@ TEMPLATES = {
     "tsrank":   {"expr": "group_rank(ts_rank({x}, {w}), industry)", "windows": [60, 120, 252], "pass": 3},
 }
 PASSES = (0, 1, 2, 3)
+# "unitless": the same idea for fields with units (prices, share counts). BRAIN's unit check rejects
+# adding the unit-free 0.0001 to a price, or regressing a price on a day counter.
+UNIT_ERROR = "Incompatible unit"
+SATURATED_DATASET = 4  # datasets behind this many submitted alphas are searched after the others
+COMMON_FIELDS = {"close", "open", "high", "low", "vwap", "volume", "returns", "cap", "adv20", "sharesout"}
 
 # What works differs by data type (BRAIN docs + community experience): the first neutralization is
 # used for screening, both are tried when tuning; decay is the screening decay.
@@ -278,6 +285,7 @@ class Miner:
         self.stage1 = self._stage1_jobs()
         self.stop = threading.Event()
         self.reference_pnls, self.ready_pnls = {}, {}
+        self.submitted_codes = []        # formulas of the submitted alphas (to steer the search away from them)
         self.run_sims, self.run_winners = 0, 0
         reported = json.loads(REPORTED.read_text(encoding="utf-8")) if REPORTED.exists() else {}
         self.reported = {k: v for k, v in reported.items() if v != "checking"}  # retry checks cut off by a stop
@@ -324,7 +332,7 @@ class Miner:
                            {k: s[k] for k in ("neutralization", "decay", "truncation") if k in s}) for s in seeds]
         else:
             candidates = []
-            for f in self.load_fields(scope):
+            for f in self.saturation_order(self.load_fields(scope)):
                 x = field_expr(f)
                 if x:
                     cat = CATEGORY_SETTINGS.get(f["category"], DEFAULT_CATEGORY)
@@ -336,6 +344,21 @@ class Miner:
                 yield {"stage": 1, "template": name, "x": x, "dataset": f["dataset"], "category": f["category"],
                        "expr": t["expr"].format(x=x, w=t["windows"][len(t["windows"]) // 2]),
                        "settings": {**BASE, **settings, **scope_settings(scope)}}
+
+    def saturation_order(self, fields):
+        """Fresh data first: fields of datasets behind many submitted alphas go after the rest, and fields a
+        submitted alpha already uses go last (new finds there keep failing SELF_CORRELATION)."""
+        used = set()
+        for code in self.submitted_codes:
+            used |= set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", code)) - COMMON_FIELDS
+        alphas_per_dataset = defaultdict(int)
+        by_id = {f["id"]: f["dataset"] for f in fields}
+        for code in self.submitted_codes:
+            for ds in {by_id[t] for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", code)
+                       if t in by_id and t not in COMMON_FIELDS}:
+                alphas_per_dataset[ds] += 1
+        rank = lambda f: 2 if f["id"] in used else 1 if alphas_per_dataset[f["dataset"]] >= SATURATED_DATASET else 0
+        return sorted(fields, key=rank)  # stable: keeps the least-crowded-first order within each group
 
     def _stage1_jobs(self):
         """Endless stream of untried stage-1 jobs: pass by pass, interleaving every scope, then refresh."""
@@ -359,6 +382,7 @@ class Miner:
 
     def refresh_references(self):
         submitted = self.brain.submitted_alphas()
+        self.submitted_codes = [(a.get("regular") or {}).get("code", "") for a in submitted]
         for a in submitted:
             if a["id"] not in self.reference_pnls:
                 self.reference_pnls[a["id"]] = self.brain.daily_pnl(a["id"])
@@ -411,17 +435,19 @@ class Miner:
         # Variants stay in the idea's own scope (region/delay/universe) and keep its truncation.
         keep = {k: job["settings"][k] for k in ("region", "delay", "universe", "truncation") if k in job["settings"]}
         for w, d, n in itertools.product(t["windows"], tune_decays(r.get("turnover")), neutralizations):
-            expr = t["expr"].format(x=job["x"], w=w)
+            expr = t["unitless" if job.get("unitless") else "expr"].format(x=job["x"], w=w)
             jobs.append({"expr": f"-({expr})" if sign < 0 else expr,
                          "settings": {**BASE, **keep, "neutralization": n, "decay": d}})
         scope_tag = "" if not {"region", "delay", "universe"} & keep.keys() else \
             "|" + "/".join(str(keep.get(k, "")) for k in ("region", "delay", "universe"))
-        fid = hashlib.sha1(f"{job['template']}|{job['x']}|{sign}{scope_tag}".encode()).hexdigest()[:12]
+        fid = hashlib.sha1(f"{job['template']}|{job['x']}|{sign}{scope_tag}{'|u' if job.get('unitless') else ''}"
+                           .encode()).hexdigest()[:12]
         with _lock:
             if fid in self.families:
                 return
             self.families[fid] = {"template": job["template"], "x": job["x"], "dataset": job.get("dataset"),
-                                  "category": job.get("category"), "sign": sign, "jobs": jobs}
+                                  "category": job.get("category"), "sign": sign, "jobs": jobs,
+                                  "unitless": bool(job.get("unitless"))}
             write_json(FAMILIES, self.families)
         log(f"  promising (S={r['sharpe']:.2f}) -> tuning {len(jobs)} variants: {job['expr']}")
         self.schedule_family(fid)
@@ -432,7 +458,8 @@ class Miner:
         with _lock:
             for j in pending:
                 self.priority.append({"stage": 2, "template": fam["template"], "x": fam["x"],
-                                      "dataset": fam.get("dataset"), "category": fam.get("category"), "fid": fid, **j})
+                                      "dataset": fam.get("dataset"), "category": fam.get("category"), "fid": fid,
+                                      "unitless": fam.get("unitless", False), **j})
         if not pending:
             self.finish_family(fid)
 
@@ -708,6 +735,12 @@ class Miner:
                     status = "error" if r.get("error") else ("pass" if not slim["fails"] else "fail")
                     print(f"{datetime.now():%H:%M:%S} sim #{self.run_sims} stage {job['stage']} {job.get('dataset', '')}: "
                           f"{status} Sharpe={r.get('sharpe')} Fitness={r.get('fitness')}", flush=True)
+                t = TEMPLATES.get(job["template"], {})
+                if (job["stage"] == 1 and UNIT_ERROR in str(r.get("error") or "") and "unitless" in t
+                        and not job.get("unitless")):
+                    w = t["windows"][len(t["windows"]) // 2]
+                    with _lock:
+                        self.priority.append({**job, "unitless": True, "expr": t["unitless"].format(x=job["x"], w=w)})
                 if passes_is(slim):
                     self.report_pass(slim)
                 if not r.get("error") and job["stage"] == 1 and abs(r["sharpe"] or 0) >= PROMISING_SHARPE:
@@ -719,7 +752,7 @@ class Miner:
                 if job:
                     with _lock:
                         self.priority.appendleft(job)
-                log(f"network problem, retrying in 2 min: {type(e).__name__}", public=True)
+                log(f"network problem, retrying in 2 min: {type(e).__name__}: {str(e)[:200]}", public=True)
                 time.sleep(120)
             except Exception as e:
                 log("worker error:\n" + traceback.format_exc())

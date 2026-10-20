@@ -148,6 +148,14 @@ simulations of that one shape its new finds kept failing SELF_CORRELATION agains
 | `to_cap` | 2 | `group_rank(x/cap, subindustry)` | Fundamental/analyst value per dollar of market cap (a "yield") |
 | `tsrank` | 3 | `group_rank(ts_rank(x, w), industry)` | Is `x` high versus its own history, compared with industry peers? |
 
+**Steering away from what you already have.** At the start of every run the miner reads your submitted alphas.
+Fields from datasets behind 4 or more of them are searched after all other fields, and fields a submitted alpha
+already uses come last. New finds there almost always fail SELF_CORRELATION.
+
+**Units.** BRAIN rejects `x + 0.0001` and `ts_regression(x, ts_step(1), w)` when `x` has a unit (a price or a
+share count). When that happens, `revision`, `volnorm` and `detrend` are retried once in a unit-free form
+(no `+ 0.0001`; `ts_zscore(x, 252)` instead of `x` in the regression), and that form is also used for tuning.
+
 **Preparing a field** (`field_expr`):
 - *Trap fields are skipped:* corporate-action bookkeeping (`adjfactor`, `split`, `dividend`) and static relationship
   counts, whose ~1% turnover caps Fitness however good the Sharpe.

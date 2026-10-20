@@ -68,21 +68,24 @@ class Brain:
 
     def request(self, method, url, **kwargs):
         url = url if url.startswith("http") else API + url
+        last = "?"
         for attempt in range(20):
             try:
                 res = self.session.request(method, url, timeout=120, **kwargs)
-            except (requests.ConnectionError, requests.Timeout):
+            except (requests.ConnectionError, requests.Timeout) as e:
                 # BRAIN occasionally drops idle connections; back off and retry rather than lose the job.
+                last = type(e).__name__
                 time.sleep(min(10 * (attempt + 1), 120))
                 continue
             if res.status_code == 401 and attempt < 2:
                 self.login()
                 continue
             if res.status_code == 429:
+                last = f"HTTP 429 (rate limited) {res.text[:120]}"
                 time.sleep(float(res.headers.get("Retry-After", 15)))
                 continue
             return res
-        raise requests.ConnectionError(f"gave up on {method} {url} after repeated failures")
+        raise requests.ConnectionError(f"gave up on {method} {url.replace(API, '')} after repeated failures; last: {last}")
 
     def simulate(self, expr, overrides=None):
         settings = {**DEFAULT_SETTINGS, **(overrides or {})}
