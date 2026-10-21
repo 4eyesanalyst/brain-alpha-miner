@@ -309,15 +309,18 @@ Setting `MINER_TELEGRAM=distinct` sends only 🆕 and 🔁 messages instead. Eac
 named after its ID, tagged `passing` and `idea-XXXXX`, and coloured green. Nothing is ever submitted
 automatically. You decide.
 
-Note: the Challenge caps a day's score at 2,000, which 1–2 strong alphas usually reach. Extra submissions on the
-same day don't add points but do use up ideas, so 1–2 distinct alphas a day earn the most over time.
+**Scoring (since 2026-10-21, "Challenge – Nigeria").** At Gold you move to a country leaderboard. Your total is an
+equal-weighted rank on three parts: **IS Score** (quality), **Uniqueness**, and **Days of Submission**. Top rankers
+may get consultant invites each week. A burst of submissions on one day counts as one day and uses up ideas, so
+submit **one distinct alpha per BRAIN day** (midnight to midnight New York time, 5 AM to 5 AM in Nigeria). The
+miner's daily "📅 Today's submission" message picks it for you (see section 3).
 
 **Doing it by hand:**
 
 1. Open the newest GitHub issue. The best alpha is listed first.
 2. On BRAIN, go to **Alphas → Unsubmitted**, find the Alpha ID, open it, check it and click **Submit**.
    Nothing needs re-typing, because the miner's simulations already live in your account.
-3. Submit **1–2 per day**. The miner drops submitted alphas from the list on its next run, and correlation-checks
+3. Submit **one per day** and keep the rest for the coming days. The miner drops submitted alphas from the list on its next run, and correlation-checks
    every future candidate against them.
 4. To see the full ready list with formulas, or to re-check alphas that have waited a few days, do this on your PC:
    ```powershell
