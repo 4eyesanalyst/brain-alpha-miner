@@ -61,6 +61,15 @@ SCOPES = [dict(zip(("region", "delay", "universe"), (r, int(d), u)))
 SMALLER_UNIVERSES = ["TOP1000", "TOP500", "TOPSP500", "TOP200"]  # a TOP3000 winner is also tried on these
 
 
+def brain_today():
+    """The Challenge counts submission days on BRAIN's clock (New York)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:  # no tz database (bare Windows Python): EDT is close enough
+        return datetime.utcnow() - timedelta(hours=4)
+
+
 def scope_name(scope):
     return f"{scope['region']}/D{scope['delay']}/{scope['universe']}"
 
@@ -79,6 +88,7 @@ STATE = DIR / "state.json"         # daily simulation counter
 REPORT = DIR / "report.json"       # day of the last Telegram daily report
 REPORTED = DIR / "reported.json"   # every alpha already run through the official check for Telegram
 SENT = DIR / "sent.json"           # alphas sent to the user (fitness, idea code), to keep new messages distinct
+PICK = DIR / "pick.json"           # the daily "submit this today" message (day, alpha, reminder sent)
 NEW_READY = DIR / "new_ready.md"   # winners found in this run (used for notifications)
 LOG = DIR / "miner.log"
 LOCK = DIR / "miner.lock"
@@ -286,6 +296,7 @@ class Miner:
         self.stop = threading.Event()
         self.reference_pnls, self.ready_pnls = {}, {}
         self.submitted_codes = []        # formulas of the submitted alphas (to steer the search away from them)
+        self.submitted_days = set()      # New York dates with at least one submission
         self.run_sims, self.run_winners = 0, 0
         reported = json.loads(REPORTED.read_text(encoding="utf-8")) if REPORTED.exists() else {}
         self.reported = {k: v for k, v in reported.items() if v != "checking"}  # retry checks cut off by a stop
@@ -383,6 +394,7 @@ class Miner:
     def refresh_references(self):
         submitted = self.brain.submitted_alphas()
         self.submitted_codes = [(a.get("regular") or {}).get("code", "") for a in submitted]
+        self.submitted_days = {(a.get("dateSubmitted") or "")[:10] for a in submitted}
         for a in submitted:
             if a["id"] not in self.reference_pnls:
                 self.reference_pnls[a["id"]] = self.brain.daily_pnl(a["id"])
@@ -764,6 +776,7 @@ class Miner:
         log(f"miner started: {len(self.tried)} simulations already tried, {len(self.families)} families in progress, "
             f"{len(self.ready)} ready" + (f", running for {MINUTES} min" if MINUTES else ""), public=True)
         self.refresh_references()
+        self.daily_pick()
         for fid in list(self.families):
             self.schedule_family(fid)
         deadline = time.time() + MINUTES * 60 if MINUTES else None
@@ -789,12 +802,62 @@ class Miner:
                 last_refresh = time.time()
                 try:
                     self.refresh_references()
+                    self.daily_pick()
                 except requests.RequestException as e:
                     log(f"refresh failed: {e}", public=True)
         self.daily_report()
         log(f"run finished: {self.run_sims} simulations, {self.run_winners} new alphas ready, "
             f"{len(self.ready)} on the ready list, {len(self.families)} families still tuning", public=True)
 
+
+    def daily_pick(self):
+        """The Challenge ranks Days of Submission, Uniqueness and IS Score equally, so one distinct alpha
+        every day beats a burst. Once per New York day, if nothing was submitted yet, send the best banked
+        alpha that still passes the official check, least correlated with the submitted ones first."""
+        now = brain_today()
+        today = now.strftime("%Y-%m-%d")
+        pick = json.loads(PICK.read_text(encoding="utf-8")) if PICK.exists() else {}
+        if today in self.submitted_days:
+            return
+        if pick.get("day") == today and pick.get("alphaId"):
+            if pick.get("reminded") or now.hour < 18:
+                return
+            if notify.send(f"⏰ Reminder: nothing submitted yet today (BRAIN day ends at midnight New York, "
+                           f"5 AM Nigeria). Submit {pick['alphaId']} to keep your Days of Submission streak.\n"
+                           f"Open: {ALPHA_URL.format(pick['alphaId'])}"):
+                write_json(PICK, {**pick, "reminded": True})
+            return
+        banked = sorted(((aid, v) for aid, v in self.sent.items() if aid not in self.reference_pnls),
+                        key=lambda x: -(x[1].get("fitness") or 0))[:15]
+        scored = []
+        for aid, v in banked:
+            pnl = self.sent_pnl(aid)
+            c = max((corr(pnl, ref) for ref in self.reference_pnls.values()), default=0.0)
+            scored.append((c >= SEND_MAX_CORRELATION, -(v.get("fitness") or 0), c, aid, v))
+        for near_copy, _, c, aid, v in sorted(scored)[:6]:
+            failed = [x["name"] for x in self.brain.check(aid).get("is", {}).get("checks", [])
+                      if x.get("result") == "FAIL"]
+            if failed:
+                with _lock:
+                    self.sent.pop(aid, None)  # no longer submittable: stop offering it
+                    write_json(SENT, self.sent)
+                log(f"  daily pick: {aid} no longer passes ({failed}), dropped")
+                continue
+            note = ("⚠️ Close to one of your submitted alphas: it still passes, but it helps Uniqueness less.\n"
+                    if near_copy else "")
+            if notify.send(f"📅 Today's submission: {aid}\n"
+                           f"Sharpe {v.get('sharpe', 0):.2f} · Fitness {v.get('fitness', 0):.2f} · "
+                           f"max correlation {c:.2f} with your submitted alphas\n{note}"
+                           f"Passes BRAIN's official check right now. Submit ONE alpha a day: Days of Submission "
+                           f"counts as much as quality, so keep the others for the coming days.\n"
+                           f"Open: {ALPHA_URL.format(aid)}"):
+                write_json(PICK, {"day": today, "alphaId": aid})
+                log(f"daily pick sent: {aid}", public=True)
+            return
+        if pick.get("day") != today and notify.send(
+                "📅 No banked alpha passes BRAIN's check right now. The miner keeps searching and will send "
+                "today's pick as soon as one turns up."):
+            write_json(PICK, {"day": today, "alphaId": None})  # retried every hour until a pick is sent
 
     def daily_report(self):
         """Once a day: a short Telegram heartbeat so silence never means 'did it stop?'."""
