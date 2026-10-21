@@ -121,7 +121,12 @@ TEMPLATES = {
     "to_cap":   {"expr": "group_rank({x}/cap, subindustry)", "windows": [None], "pass": 2,
                  "categories": {"fundamental", "analyst"}},
     "tsrank":   {"expr": "group_rank(ts_rank({x}, {w}), industry)", "windows": [60, 120, 252], "pass": 3},
+    # two near-miss signals from different datasets, equally weighted (built by combo_jobs, not per field)
+    "combo":    {"expr": "{x}", "windows": [None], "pass": None},
 }
+COMBOS_PER_RUN = 90        # combo simulations queued at the start of each run
+COMBO_MIN_SHARPE = 1.0     # near-miss: Sharpe at least this, Fitness 0.5-1.0, failing only on signal strength
+WEAK_FAILS = {"LOW_FITNESS", "LOW_SHARPE", "LOW_SUB_UNIVERSE_SHARPE"}
 PASSES = (0, 1, 2, 3)
 # "unitless": the same idea for fields with units (prices, share counts). BRAIN's unit check rejects
 # adding the unit-free 0.0001 to a price, or regressing a price on a day counter.
@@ -355,6 +360,50 @@ class Miner:
                 yield {"stage": 1, "template": name, "x": x, "dataset": f["dataset"], "category": f["category"],
                        "expr": t["expr"].format(x=x, w=t["windows"][len(t["windows"]) // 2]),
                        "settings": {**BASE, **settings, **scope_settings(scope)}}
+
+    def combo_jobs(self):
+        """Near misses from different datasets, added together. Their noise partly cancels, so the pair often
+        clears Fitness 1.0 where neither does, and the blend is a new shape (good for Uniqueness)."""
+        catalogue = {f["id"] for f in self.load_fields({"region": "USA", "delay": 1, "universe": "TOP3000"})}
+        used = set()
+        for code in self.submitted_codes:
+            used |= (set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", code)) & catalogue) - COMMON_FIELDS
+        best = {}
+        for r in self.tried.values():
+            st = r.get("settings") or {}
+            if (r.get("error") or r.get("template") == "combo" or st.get("delay", 1) != 1
+                    or st.get("universe", "TOP3000") != "TOP3000" or (r.get("sharpe") or 0) < COMBO_MIN_SHARPE
+                    or not 0.5 <= (r.get("fitness") or 0) < MIN_FITNESS or not set(r.get("fails") or []) <= WEAK_FAILS
+                    or used & set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", r["expr"]))):
+                continue
+            idea = idea_code(r["expr"])
+            if idea not in best or r["fitness"] > best[idea]["fitness"]:
+                best[idea] = r
+        per_ds = defaultdict(list)
+        for r in sorted(best.values(), key=lambda r: -r["fitness"]):
+            if len(per_ds[r.get("dataset")]) < 5:
+                per_ds[r.get("dataset")].append(r)
+        pool = [r for rs in per_ds.values() for r in rs]
+        pairs = sorted(((a, b) for i, a in enumerate(pool) for b in pool[i + 1:] if a.get("dataset") != b.get("dataset")),
+                       key=lambda ab: -(ab[0]["fitness"] + ab[1]["fitness"]))
+        jobs, uses = [], defaultdict(int)
+        for a, b in pairs:
+            if uses[a["expr"]] >= 4 or uses[b["expr"]] >= 4:
+                continue  # spread the budget over many signals
+            expr = f"rank({a['expr']}) + rank({b['expr']})"
+            sa, sb = a["settings"], b["settings"]
+            settings = {**BASE, **scope_settings({"region": "USA", "delay": 1, "universe": "TOP3000"}),
+                        "neutralization": sa.get("neutralization", "INDUSTRY"),
+                        "decay": max(sa.get("decay", 0), sb.get("decay", 0))}
+            if key(expr, settings) in self.tried:
+                continue
+            uses[a["expr"]] += 1
+            uses[b["expr"]] += 1
+            jobs.append({"stage": 1, "template": "combo", "x": expr, "expr": expr, "settings": settings,
+                         "dataset": f"{a.get('dataset')}+{b.get('dataset')}", "category": a.get("category", "")})
+            if len(jobs) >= COMBOS_PER_RUN:
+                break
+        return jobs
 
     def saturation_order(self, fields):
         """Fresh data first: fields of datasets behind many submitted alphas go after the rest, and fields a
@@ -777,6 +826,10 @@ class Miner:
             f"{len(self.ready)} ready" + (f", running for {MINUTES} min" if MINUTES else ""), public=True)
         self.refresh_references()
         self.daily_pick()
+        combos = self.combo_jobs()
+        with _lock:
+            self.priority.extend(combos)
+        log(f"queued {len(combos)} combinations of near-miss signals", public=True)
         for fid in list(self.families):
             self.schedule_family(fid)
         deadline = time.time() + MINUTES * 60 if MINUTES else None

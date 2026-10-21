@@ -148,6 +148,8 @@ simulations of that one shape its new finds kept failing SELF_CORRELATION agains
 | `to_cap` | 2 | `group_rank(x/cap, subindustry)` | Fundamental/analyst value per dollar of market cap (a "yield") |
 | `tsrank` | 3 | `group_rank(ts_rank(x, w), industry)` | Is `x` high versus its own history, compared with industry peers? |
 
+**Combinations of near misses.** At the start of every run the miner takes signals that came close (TOP3000, Delay 1, Sharpe ≥ 1, Fitness 0.5–1.0, failing only on signal strength, not using a field from a submitted alpha). It keeps the best per idea and the top 5 per dataset, then queues up to 90 pairs from different datasets as `rank(A) + rank(B)`. Their noise partly cancels, so a pair often clears Fitness 1.0 where neither signal does alone. Promising pairs are tuned like any other idea.
+
 **Daily pick (country Challenge).** The Nigeria Challenge ranks IS Score, Uniqueness and Days of Submission equally, so one distinct alpha per day beats a burst. Once per New York day, if you haven't submitted yet, the miner re-checks the alphas it already sent you and messages "📅 Today's submission": the one least correlated with your submitted alphas that still passes the official check. Alphas that fail are dropped. If nothing passes, it tries again every hour. After 6 PM New York time (11 PM Nigeria), if you still haven't submitted, it sends one reminder. State is kept in `miner/pick.json`.
 
 **Steering away from what you already have.** At the start of every run the miner reads your submitted alphas.
