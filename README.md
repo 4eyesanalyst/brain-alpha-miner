@@ -349,6 +349,7 @@ work from different copies of the progress and overwrite each other. Disable the
 | `MINER_MINUTES` | env / repository variable | `0` locally (forever), `335` in Actions | Mine this long, then save and exit (and start the next run) |
 | `MINER_CHAIN` | repository variable | `on` | `off` stops the 24/7 chain of runs |
 | `MINER_TELEGRAM` | env / repository variable | `all` | `all` = every passing alpha; `distinct` = only new ideas and better versions |
+| `MINER_TELEGRAM_MIN_FITNESS` | env / repository variable | `1.3` | Only messages passing alphas at least this strong that aren't near-copies; weaker ones are banked quietly for the daily pick |
 | `MINER_MAX_SIMS_PER_DAY` | env / repository variable | `600` locally, `5000` in Actions | Daily simulation cap (in the cloud it's effectively time-limited) |
 | `MIN_FITNESS`, `MIN_STABILITY`, `MAX_BAD_YEARS`, `MIN_RECENT_SHARPE`, `MAX_CORRELATION` | top of `miner.py` | 1.0, 0.34, 1, 0.5, 0.7 | Strictness of the gates |
 | `TEMPLATES`, `CATEGORY_SETTINGS`, `tune_decays`, `TRAP_FIELDS` | `miner.py` | see file | The idea space being searched |

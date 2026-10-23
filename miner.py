@@ -50,6 +50,9 @@ SEND_MAX_CORRELATION = 0.6  # above this PnL correlation an alpha counts as a ne
 # "all": every alpha passing BRAIN's official check goes to Telegram (near-copies flagged).
 # "distinct": near-copies of submitted/already-sent alphas are held back.
 TELEGRAM_MODE = os.environ.get("MINER_TELEGRAM", "all").lower()
+# Weaker passes are banked silently (the daily pick can still use them) instead of messaged: submitting
+# borderline alphas drags the merged IS Score down, and dozens of messages a day bury the good ones.
+TELEGRAM_MIN_FITNESS = float(os.environ.get("MINER_TELEGRAM_MIN_FITNESS", 1.3))
 MIN_FIELD_COVERAGE = 0.3
 FIELDS_MAX_AGE_DAYS = 7
 
@@ -715,8 +718,9 @@ class Miner:
             header += (f"📉 This is the {s['universe']} version. The Challenge scores smaller universes higher, "
                        f"so prefer it over the TOP3000 one if the stats are similar.\n\n")
         years_txt = " ".join(f"{y[2:]}:{v:+.1f}" for y, v in years.items())
-        log(f"  PASS sent to Telegram: {aid} {r['expr']}")
-        notify.send(header
+        quiet = (r["fitness"] or 0) < TELEGRAM_MIN_FITNESS or copy_of_submitted or (sibling and not replaces)
+        log(f"  PASS {'banked quietly (weak or near-copy)' if quiet else 'sent to Telegram'}: {aid} {r['expr']}")
+        quiet or notify.send(header
                     + f"✅ Passing alpha: {aid}\n"
                     f"Idea {code} · data: {r.get('dataset') or 'unknown'}\n"
                     f"Sharpe {r['sharpe']:.2f} · Fitness {r['fitness']:.2f} · Turnover {r['turnover']*100:.1f}%\n"
