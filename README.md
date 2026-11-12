@@ -143,6 +143,8 @@ simulations of that one shape its new finds kept failing SELF_CORRELATION agains
 | `detrend` | 1 | `group_rank(ts_regression(x, ts_step(1), w), industry)` | Distance from its own linear trend |
 | `recency` | 1 | `group_rank(-ts_arg_max(x, w), industry)` | How recently `x` peaked. Fresh highs in estimates, news or sentiment lead price |
 | `volgate` | 1 | `trade_when(volume > ts_mean(volume, 20), group_rank(ts_zscore(x, w), industry), -1)` | Re-trade only when volume confirms the market is reacting; hold otherwise |
+| `volboost` | 1 | `group_rank(if_else(volume > adv20, 2 * ts_zscore(x, w), ts_zscore(x, w)), industry)` | Double the position on days of above-average volume, when the market is reacting (BRAIN Intermediate Pack 3/3) |
+| `capgroup` | 1 | `group_neutralize(ts_zscore(x, w), bucket(rank(cap), range="0.1,1,0.1"))` | Compare stocks only with others of similar size, a custom group neutralization (BRAIN community, improving Sharpe) |
 | `zscore` | 2 | `ts_zscore(x, w)` | How unusual is today's `x` for this stock? |
 | `level` | 2 | `group_rank(x, subindustry)` | Is `x` high compared with direct competitors? |
 | `to_cap` | 2 | `group_rank(x/cap, subindustry)` | Fundamental/analyst value per dollar of market cap (a "yield") |

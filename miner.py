@@ -127,6 +127,12 @@ TEMPLATES = {
     # only re-trade when volume confirms (the market is reacting), hold otherwise; also cuts turnover
     "volgate":  {"expr": "trade_when(volume > ts_mean(volume, 20), group_rank(ts_zscore({x}, {w}), industry), -1)",
                  "windows": [22, 66, 126], "pass": 1},
+    # BRAIN Intermediate Pack 3/3: the same signal, taken at double size on days of above-average volume
+    "volboost": {"expr": "group_rank(if_else(volume > adv20, 2 * ts_zscore({x}, {w}), ts_zscore({x}, {w})), industry)",
+                 "windows": [22, 66, 126], "pass": 1},
+    # BRAIN community (improve Sharpe): neutralize within size groups (market-cap deciles) instead of industries
+    "capgroup": {"expr": "group_neutralize(ts_zscore({x}, {w}), bucket(rank(cap), range=\"0.1,1,0.1\"))",
+                 "windows": [22, 66, 126], "pass": 1},
     "zscore":   {"expr": "ts_zscore({x}, {w})", "windows": [60, 126, 252], "pass": 2},
     "level":    {"expr": "group_rank({x}, subindustry)", "windows": [None], "pass": 2},
     "to_cap":   {"expr": "group_rank({x}/cap, subindustry)", "windows": [None], "pass": 2,
