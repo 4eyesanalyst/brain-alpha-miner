@@ -160,6 +160,10 @@ Alphas that fail are banked quietly and the daily pick skips them. Messages show
 
 **Daily pick (country Challenge).** The Nigeria Challenge ranks IS Score, Uniqueness and Days of Submission equally, so one distinct alpha per day beats a burst. Once per New York day, if you haven't submitted yet, the miner re-checks the alphas it already sent you and messages "📅 Today's submission": the one least correlated with your submitted alphas that still passes the official check. Alphas that fail are dropped. If nothing passes, it tries again every hour. After 6 PM New York time (11 PM Nigeria), if you still haven't submitted, it sends one reminder. State is kept in `miner/pick.json`.
 
+*Uniqueness first (since 2026-11-12).* Among strong banked alphas (Fitness ≥ 1.3 when there are any), the pick prefers, in order: not a near-copy of a submitted alpha; passed the overfitting tests; a dataset not used by your last 3 submissions; the lowest correlation with your submitted alphas (in steps of 0.1); and only then the highest Fitness. The message names the data used.
+
+*Unfinished checks.* BRAIN sometimes answers ERROR or PENDING for a check, usually SELF_CORRELATION when it's busy. That doesn't count as a pass: the miner asks again twice, 90 seconds apart, and otherwise re-checks on the next run.
+
 **Steering away from what you already have.** At the start of every run the miner reads your submitted alphas.
 Fields from datasets behind 4 or more of them are searched after all other fields, and fields a submitted alpha
 already uses come last. New finds there almost always fail SELF_CORRELATION.
@@ -274,7 +278,7 @@ These are honest estimates; the real numbers build up in `miner/tried.jsonl` ove
    - 🔴 **Run failed**: an error stopped a run (with a link to it). ⏹️ **Run stopped** means it was stopped from
      outside (a manual restart or GitHub's 6-hour limit). Progress is saved and the chain restarts by itself. If BRAIN asks for an identity check, the link comes here
      privately instead of appearing in the public log.
-   - ⚪ **Daily report**, once a day: simulations, promising ideas, alphas waiting, ideas being tuned.
+   - ⚪ **Daily report**, once a day: your leaderboard row (rank, score, Days of Submission, IS Score, Uniqueness) with the change over the last 7 days (🟢 better, 🔴 worse), then simulations, promising ideas, alphas waiting and ideas being tuned. On Mondays the leaderboard part is headed 📊 Weekly scoreboard. History: `miner/scoreboard.json`.
 
    Winners are also posted as a GitHub issue at the end of each run, which GitHub emails to you.
 

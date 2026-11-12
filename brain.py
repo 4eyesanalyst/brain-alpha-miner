@@ -171,6 +171,12 @@ class Brain:
     def submitted_alphas(self):
         return self.request("GET", "/users/self/alphas", params={"status": "ACTIVE", "limit": 100}).json().get("results", [])
 
+    def leaderboard(self):
+        """Your row on the Challenge leaderboard (rank, score, daysOfSubmission, isScore, uniquenessScore)."""
+        comps = self.request("GET", "/users/self/competitions").json().get("results", [])
+        row = next((c for c in comps if c.get("id") == "challenge"), comps[0] if comps else {})
+        return {**(row.get("leaderboard") or {}), "competition": row.get("name")}
+
     def check(self, alpha_id):
         """Run the full pre-submission check (incl. self/prod correlation) — same as 'Check Submission'."""
         return self._poll(f"/alphas/{alpha_id}/check", timeout=900)

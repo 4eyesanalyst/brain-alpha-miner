@@ -99,6 +99,7 @@ STATE = DIR / "state.json"         # daily simulation counter
 REPORT = DIR / "report.json"       # day of the last Telegram daily report
 REPORTED = DIR / "reported.json"   # every alpha already run through the official check for Telegram
 SENT = DIR / "sent.json"           # alphas sent to the user (fitness, idea code), to keep new messages distinct
+SCOREBOARD = DIR / "scoreboard.json"  # one leaderboard snapshot per day, for week-over-week progress
 PICK = DIR / "pick.json"           # the daily "submit this today" message (day, alpha, reminder sent)
 NEW_READY = DIR / "new_ready.md"   # winners found in this run (used for notifications)
 LOG = DIR / "miner.log"
@@ -329,6 +330,8 @@ class Miner:
         self.reference_pnls, self.ready_pnls = {}, {}
         self.submitted_codes = []        # formulas of the submitted alphas (to steer the search away from them)
         self.submitted_days = set()      # New York dates with at least one submission
+        self.submitted_order = []        # submitted alpha IDs, newest first (for dataset rotation)
+        self._dataset_by_alpha = {}
         self.run_sims, self.run_winners = 0, 0
         reported = json.loads(REPORTED.read_text(encoding="utf-8")) if REPORTED.exists() else {}
         self.reported = {k: v for k, v in reported.items() if v != "checking"}  # retry checks cut off by a stop
@@ -471,6 +474,8 @@ class Miner:
         submitted = self.brain.submitted_alphas()
         self.submitted_codes = [(a.get("regular") or {}).get("code", "") for a in submitted]
         self.submitted_days = {(a.get("dateSubmitted") or "")[:10] for a in submitted}
+        self.submitted_order = [a["id"] for a in sorted(submitted, key=lambda a: a.get("dateSubmitted") or "",
+                                                        reverse=True)]
         for a in submitted:
             if a["id"] not in self.reference_pnls:
                 self.reference_pnls[a["id"]] = self.brain.daily_pnl(a["id"])
@@ -697,6 +702,23 @@ class Miner:
             f"{k} test kept {v:.0%}" for k, v in br.items())
         return all(v >= MIN_BRACKET_RATIO for v in br.values()), txt
 
+    def official_check(self, aid):
+        """(failed, unresolved) from BRAIN's pre-submission check. When BRAIN is busy a check can come back ERROR or
+        PENDING (usually SELF_CORRELATION); that is not a pass, so ask again a couple of times before deciding."""
+        failed, unresolved = [], []
+        for attempt in range(3):
+            try:
+                checks = self.brain.check(aid).get("is", {}).get("checks", [])
+            except requests.RequestException:  # BRAIN too slow to answer: unresolved, not a crash
+                return [], ["CHECK_TIMEOUT"]
+            failed = [c["name"] for c in checks if c.get("result") == "FAIL"]
+            unresolved = [c["name"] for c in checks if c.get("result") in ("ERROR", "PENDING")]
+            if failed or not unresolved:
+                return failed, []
+            if attempt < 2:
+                time.sleep(90)
+        return failed, unresolved
+
     def report_pass(self, r):
         """Run the official check on an alpha that passed the IS checks; if it passes, send it to Telegram."""
         aid = r["alphaId"]
@@ -704,8 +726,12 @@ class Miner:
             if aid in self.reported:
                 return
             self.reported[aid] = "checking"
-        checks = self.brain.check(aid).get("is", {}).get("checks", [])
-        failed = [c["name"] for c in checks if c.get("result") == "FAIL"]
+        failed, unresolved = self.official_check(aid)
+        if unresolved:
+            with _lock:
+                self.reported.pop(aid, None)  # the next run's backlog pass asks BRAIN again
+            log(f"  {aid}: BRAIN could not finish {unresolved}; will re-check next run")
+            return
         if failed:
             self._mark(aid, "fail:" + ",".join(failed))
             log(f"  {aid} passed the simulation checks but failed the official check: {failed}")
@@ -888,7 +914,10 @@ class Miner:
         log(f"miner started: {len(self.tried)} simulations already tried, {len(self.families)} families in progress, "
             f"{len(self.ready)} ready" + (f", running for {MINUTES} min" if MINUTES else ""), public=True)
         self.refresh_references()
-        self.daily_pick()
+        try:
+            self.daily_pick()
+        except requests.RequestException as e:
+            log(f"daily pick postponed (BRAIN busy): {type(e).__name__}", public=True)  # retried hourly
         combos = self.combo_jobs()
         with _lock:
             self.priority.extend(combos)
@@ -926,6 +955,13 @@ class Miner:
             f"{len(self.ready)} on the ready list, {len(self.families)} families still tuning", public=True)
 
 
+    def datasets_of(self, aid):
+        """The dataset(s) an alpha found by the miner uses (a combo has two)."""
+        if aid not in self._dataset_by_alpha:
+            self._dataset_by_alpha = {r["alphaId"]: r.get("dataset") or "" for r in list(self.tried.values())
+                                      if r.get("alphaId")}
+        return set(filter(None, (self._dataset_by_alpha.get(aid) or "").split("+")))
+
     def daily_pick(self):
         """The Challenge ranks Days of Submission, Uniqueness and IS Score equally, so one distinct alpha
         every day beats a burst. Once per New York day, if nothing was submitted yet, send the best banked
@@ -943,18 +979,27 @@ class Miner:
                            f"Open: {ALPHA_URL.format(pick['alphaId'])}"):
                 write_json(PICK, {**pick, "reminded": True})
             return
-        banked = sorted(((aid, v) for aid, v in self.sent.items() if aid not in self.reference_pnls),
-                        key=lambda x: -(x[1].get("fitness") or 0))[:15]
+        # Uniqueness first: among strong banked alphas (Fitness >= TELEGRAM_MIN_FITNESS when there are any), prefer
+        # the one least correlated with everything submitted, and rotate away from the datasets of the last few
+        # submissions. Fitness only breaks ties between similarly distinct alphas.
+        unsubmitted = [(aid, v) for aid, v in self.sent.items() if aid not in self.reference_pnls]
+        strong = [x for x in unsubmitted if (x[1].get("fitness") or 0) >= TELEGRAM_MIN_FITNESS]
+        banked = sorted(strong or unsubmitted, key=lambda x: -(x[1].get("fitness") or 0))[:40]
+        recent_ds = set().union(*(self.datasets_of(a) for a in self.submitted_order[:3])) if self.submitted_order else set()
         scored = []
         for aid, v in banked:
             pnl = self.sent_pnl(aid)
             c = max((corr(pnl, ref) for ref in self.reference_pnls.values()), default=0.0)
             if v.get("robust") is False or holdout_ratio(pnl) < MIN_HOLDOUT_RATIO:
                 continue  # fragile: strong in the early years only, or failed the bracket tests
-            scored.append((c >= SEND_MAX_CORRELATION, v.get("robust") is not True, -(v.get("fitness") or 0), c, aid, v))
-        for near_copy, _, _, c, aid, v in sorted(scored)[:6]:
-            failed = [x["name"] for x in self.brain.check(aid).get("is", {}).get("checks", [])
-                      if x.get("result") == "FAIL"]
+            repeat_ds = bool(self.datasets_of(aid) & recent_ds)
+            scored.append((c >= SEND_MAX_CORRELATION, v.get("robust") is not True, repeat_ds, round(c, 1),
+                           -(v.get("fitness") or 0), c, aid, v))
+        for near_copy, _, _, _, _, c, aid, v in sorted(scored)[:6]:
+            failed, unresolved = self.official_check(aid)
+            if unresolved:
+                log(f"  daily pick: BRAIN could not finish {unresolved} for {aid}; skipped for now")
+                continue
             if failed:
                 with _lock:
                     self.sent.pop(aid, None)  # no longer submittable: stop offering it
@@ -972,9 +1017,11 @@ class Miner:
                     continue
             note = ("⚠️ Close to one of your submitted alphas: it still passes, but it helps Uniqueness less.\n"
                     if near_copy else "")
+            data = " + ".join(sorted(self.datasets_of(aid))) or "unknown"
             if notify.send(f"📅 Today's submission: {aid}\n"
-                           f"Sharpe {v.get('sharpe', 0):.2f} · Fitness {v.get('fitness', 0):.2f} · "
-                           f"max correlation {c:.2f} with your submitted alphas\n{note}"
+                           f"Sharpe {v.get('sharpe', 0):.2f} · Fitness {v.get('fitness', 0):.2f} · data: {data}\n"
+                           f"Max correlation {c:.2f} with your submitted alphas (picked as the most different "
+                           f"strong one, for Uniqueness)\n{note}"
                            f"Passes BRAIN's official check right now. Submit ONE alpha a day: Days of Submission "
                            f"counts as much as quality, so keep the others for the coming days.\n"
                            f"Open: {ALPHA_URL.format(aid)}"):
@@ -986,6 +1033,38 @@ class Miner:
                 "today's pick as soon as one turns up."):
             write_json(PICK, {"day": today, "alphaId": None})  # retried every hour until a pick is sent
 
+    def scoreboard_text(self):
+        """Today's leaderboard numbers with the change over the last 7 days; a weekly header on Mondays."""
+        try:
+            lb = self.brain.leaderboard()
+        except requests.RequestException:
+            return ""
+        if not lb.get("rank"):
+            return ""
+        history = json.loads(SCOREBOARD.read_text(encoding="utf-8")) if SCOREBOARD.exists() else []
+        today = brain_today().strftime("%Y-%m-%d")
+        snap = {"day": today, **{k: lb.get(k) for k in ("rank", "score", "daysOfSubmission", "isScore", "uniquenessScore")}}
+        history = [h for h in history if h["day"] != today] + [snap]
+        write_json(SCOREBOARD, history[-120:])
+        week_ago = (brain_today() - timedelta(days=7)).strftime("%Y-%m-%d")
+        base = next((h for h in reversed(history) if h["day"] <= week_ago), history[0])
+
+        def line(label, k, fmt, better_low=False):
+            now, then = snap.get(k), base.get(k)
+            if now is None:
+                return ""
+            if then is None or base is snap:
+                return f"{label}: {now:{fmt}}\n"
+            d = now - then
+            arrow = "➖" if not d else ("🟢" if (d < 0 if better_low else d > 0) else "🔴")
+            return f"{label}: {now:{fmt}} ({arrow} {d:+{fmt}} since {base['day']})\n"
+
+        weekly = brain_today().weekday() == 0
+        return ((f"📊 Weekly scoreboard, {lb.get('competition') or 'Challenge'}\n" if weekly else "📊 Leaderboard\n")
+                + line("Rank", "rank", ",d", better_low=True) + line("Score", "score", ".2f")
+                + line("Days of Submission", "daysOfSubmission", "d") + line("IS Score", "isScore", ",.0f")
+                + line("Uniqueness", "uniquenessScore", ".2f") + "\n")
+
     def daily_report(self):
         """Once a day: a short Telegram heartbeat so silence never means 'did it stop?'."""
         today = str(date.today())
@@ -995,7 +1074,8 @@ class Miner:
         last_day = [r for r in self.tried.values() if (r.get("time") or "") >= cutoff]
         promising = sum(abs(r.get("sharpe") or 0) >= PROMISING_SHARPE for r in last_day)
         waiting = ", ".join(r["alphaId"] for r in self.ready) or "none"
-        if notify.send(f"⚪ Daily miner report\n"
+        board = self.scoreboard_text()
+        if notify.send(board + f"⚪ Daily miner report\n"
                        f"Last 24h: {len(last_day)} simulations, {promising} promising\n"
                        f"Ready to submit: {waiting}\n"
                        f"Ideas being tuned: {len(self.families)} · total simulations so far: {len(self.tried)}"):
