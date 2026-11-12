@@ -150,6 +150,12 @@ simulations of that one shape its new finds kept failing SELF_CORRELATION agains
 
 **Combinations of near misses.** At the start of every run the miner takes signals that came close (TOP3000, Delay 1, Sharpe ≥ 1, Fitness 0.5–1.0, failing only on signal strength, not using a field from a submitted alpha). It keeps the best per idea and the top 5 per dataset, then queues up to 90 pairs from different datasets as `rank(A) + rank(B)`. Their noise partly cancels, so a pair often clears Fitness 1.0 where neither signal does alone. Promising pairs are tuned like any other idea.
 
+**Overfitting tests.** These follow BRAIN's Test Period guide and community rules. Before an alpha is messaged:
+1. *Hold-out split.* The last year of the 5-year in-sample period is the test period. BRAIN's Test Period setting only splits the stats, so the same split is computed from the daily PnL. The last year's Sharpe must keep at least 50% of the earlier years' Sharpe.
+2. *Bracket tests.* The alpha is re-simulated as `sign(rank(alpha) - 0.5)`, which keeps only the direction, and as `rank(alpha)`, unless it's already a rank. If either version loses more than 70% of the Sharpe, the result depended on exact values, which is a sign of overfitting.
+
+Alphas that fail are banked quietly and the daily pick skips them. Messages show the test results. On 2026-11-12, 31 of the 43 submitted alphas passed the hold-out split.
+
 **Daily pick (country Challenge).** The Nigeria Challenge ranks IS Score, Uniqueness and Days of Submission equally, so one distinct alpha per day beats a burst. Once per New York day, if you haven't submitted yet, the miner re-checks the alphas it already sent you and messages "📅 Today's submission": the one least correlated with your submitted alphas that still passes the official check. Alphas that fail are dropped. If nothing passes, it tries again every hour. After 6 PM New York time (11 PM Nigeria), if you still haven't submitted, it sends one reminder. State is kept in `miner/pick.json`.
 
 **Steering away from what you already have.** At the start of every run the miner reads your submitted alphas.

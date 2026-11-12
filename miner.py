@@ -53,6 +53,14 @@ TELEGRAM_MODE = os.environ.get("MINER_TELEGRAM", "all").lower()
 # Weaker passes are banked silently (the daily pick can still use them) instead of messaged: submitting
 # borderline alphas drags the merged IS Score down, and dozens of messages a day bury the good ones.
 TELEGRAM_MIN_FITNESS = float(os.environ.get("MINER_TELEGRAM_MIN_FITNESS", 1.3))
+# Overfitting tests (BRAIN's Test Period guide + community rules). BRAIN's Test Period setting doesn't change the
+# simulation, it only splits the stats, so the same split is computed from the daily PnL: the last year is the
+# test period (an 80/20 split of the 5-year IS), and its Sharpe must keep at least half of the train Sharpe.
+HOLDOUT_DAYS = 252
+MIN_HOLDOUT_RATIO = 0.5
+# Bracketing: re-simulate as rank(alpha) and as sign(rank(alpha) - 0.5) (direction only). A real signal keeps a
+# good part of its Sharpe; a drop of more than 70% means the result hinged on exact values (likely overfit).
+MIN_BRACKET_RATIO = 0.3
 MIN_FIELD_COVERAGE = 0.3
 FIELDS_MAX_AGE_DAYS = 7
 
@@ -277,6 +285,16 @@ def recent_sharpe(pnl, days=504):
     vals = [pnl[d] for d in sorted(pnl)][-days:]
     sd = statistics.pstdev(vals) if len(vals) > 60 else 0
     return statistics.mean(vals) / sd * math.sqrt(252) if sd else 0.0
+
+
+def holdout_ratio(pnl):
+    """Test-period Sharpe / train-period Sharpe (last HOLDOUT_DAYS vs everything before)."""
+    vals = [pnl[d] for d in sorted(pnl)]
+    def sharpe(xs):
+        sd = statistics.pstdev(xs) if len(xs) > 60 else 0
+        return statistics.mean(xs) / sd * math.sqrt(252) if sd else 0.0
+    train, test = sharpe(vals[:-HOLDOUT_DAYS]), sharpe(vals[-HOLDOUT_DAYS:])
+    return test / train if train > 0 else 0.0
 
 
 def write_json(path, data):
@@ -648,6 +666,31 @@ class Miner:
         return True
 
     # ---- Telegram: every alpha that passes BRAIN's checks -------------------------------
+    def bracket_ratios(self, r):
+        """Sharpe kept by the rank() and sign() versions of an alpha (1.0 = all of it). Rank is skipped when the
+        alpha is already a rank, where it would change nothing."""
+        expr, out = r["expr"], {}
+        tests = {"sign": f"sign(rank({expr}) - 0.5)"}
+        if not re.match(r"-?\(?(group_)?rank\(", expr):
+            tests["rank"] = f"rank({expr})"
+        for name, e in tests.items():
+            try:
+                b = self.brain.simulate(e, r["settings"])
+            except requests.RequestException:
+                continue  # BRAIN busy: judge on the tests that did run
+            out[name] = (b.get("sharpe") or 0) / r["sharpe"] if not b.get("error") and r.get("sharpe") else 0.0
+        return out
+
+    def robustness(self, r, pnl):
+        """(robust, text): the hold-out split always, the bracket simulations only when the split passes."""
+        hold = holdout_ratio(pnl)
+        if hold < MIN_HOLDOUT_RATIO:
+            return False, f"last-year Sharpe kept only {hold:.0%} of the earlier years (needs {MIN_HOLDOUT_RATIO:.0%})"
+        br = self.bracket_ratios(r)
+        txt = f"last year kept {hold:.0%} of the earlier Sharpe · " + " · ".join(
+            f"{k} test kept {v:.0%}" for k, v in br.items())
+        return all(v >= MIN_BRACKET_RATIO for v in br.values()), txt
+
     def report_pass(self, r):
         """Run the official check on an alpha that passed the IS checks; if it passes, send it to Telegram."""
         aid = r["alphaId"]
@@ -719,7 +762,16 @@ class Miner:
                        f"so prefer it over the TOP3000 one if the stats are similar.\n\n")
         years_txt = " ".join(f"{y[2:]}:{v:+.1f}" for y, v in years.items())
         quiet = (r["fitness"] or 0) < TELEGRAM_MIN_FITNESS or copy_of_submitted or (sibling and not replaces)
-        log(f"  PASS {'banked quietly (weak or near-copy)' if quiet else 'sent to Telegram'}: {aid} {r['expr']}")
+        robust_txt = ""
+        if not quiet:  # only candidates worth a message get the extra simulations
+            robust, robust_txt = self.robustness(r, pnl)
+            with _lock:
+                self.sent[aid]["robust"] = robust
+                write_json(SENT, self.sent)
+            if not robust:
+                log(f"  {aid} failed the overfitting tests: {robust_txt}")
+                quiet = True
+        log(f"  PASS {'banked quietly (weak, near-copy or fragile)' if quiet else 'sent to Telegram'}: {aid} {r['expr']}")
         quiet or notify.send(header
                     + f"✅ Passing alpha: {aid}\n"
                     f"Idea {code} · data: {r.get('dataset') or 'unknown'}\n"
@@ -729,6 +781,7 @@ class Miner:
                     f"Max correlation {corrs[closest] if closest else 0:.2f} with your submitted alphas"
                     + (f" ({closest})" if closest else "")
                     + f", {max_pending:.2f} with other alphas sent to you\n"
+                    f"Overfitting tests passed: {robust_txt}\n"
                     f"Settings: {s.get('region', 'USA')} {s.get('universe', 'TOP3000')} · Delay {s.get('delay', 1)} · "
                     f"{s['neutralization']}, decay {s['decay']}, truncation {s['truncation']}\n"
                     f"Open: {ALPHA_URL.format(aid)}\n"
@@ -890,8 +943,10 @@ class Miner:
         for aid, v in banked:
             pnl = self.sent_pnl(aid)
             c = max((corr(pnl, ref) for ref in self.reference_pnls.values()), default=0.0)
-            scored.append((c >= SEND_MAX_CORRELATION, -(v.get("fitness") or 0), c, aid, v))
-        for near_copy, _, c, aid, v in sorted(scored)[:6]:
+            if v.get("robust") is False or holdout_ratio(pnl) < MIN_HOLDOUT_RATIO:
+                continue  # fragile: strong in the early years only, or failed the bracket tests
+            scored.append((c >= SEND_MAX_CORRELATION, v.get("robust") is not True, -(v.get("fitness") or 0), c, aid, v))
+        for near_copy, _, _, c, aid, v in sorted(scored)[:6]:
             failed = [x["name"] for x in self.brain.check(aid).get("is", {}).get("checks", [])
                       if x.get("result") == "FAIL"]
             if failed:
@@ -900,6 +955,15 @@ class Miner:
                     write_json(SENT, self.sent)
                 log(f"  daily pick: {aid} no longer passes ({failed}), dropped")
                 continue
+            if v.get("robust") is None:  # banked before the overfitting tests existed
+                rec = next((t for t in self.tried.values() if t.get("alphaId") == aid), None)
+                robust, txt = self.robustness(rec, self.sent_pnl(aid)) if rec else (False, "no record")
+                with _lock:
+                    self.sent[aid]["robust"] = robust
+                    write_json(SENT, self.sent)
+                if not robust:
+                    log(f"  daily pick: {aid} failed the overfitting tests ({txt}), skipped")
+                    continue
             note = ("⚠️ Close to one of your submitted alphas: it still passes, but it helps Uniqueness less.\n"
                     if near_copy else "")
             if notify.send(f"📅 Today's submission: {aid}\n"
